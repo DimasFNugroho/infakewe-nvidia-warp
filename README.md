@@ -120,12 +120,22 @@ python examples/yarn_plane_friction_vispy.py
 # OGC (Offset Geometric Contact, SIGGRAPH 2025) demo
 python examples/yarn_cylinder_ogc_vispy.py
 
+# OGC demo with a live Tkinter control panel (runs the sim in a subprocess)
+python examples/yarn_cylinder_ogc_gui.py
 ```
 
 The `yarn_cylinder_ogc_vispy.py` example replaces the analytic cylinder
 collision with a full OGC contact pipeline implemented in
 `examples/ogc/algorithm{1,2,3,4}.py` (Warp kernels). The cylinder is
 treated as a triangulated mesh plus an offset radius `r`.
+
+The `yarn_cylinder_ogc_gui.py` variant spawns the simulation + vispy
+viewer in a child process and drives it from a Tkinter control panel in
+the parent: sliders for gravity, damping, stretch/bend stiffness,
+substeps, OGC radius, contact stiffness, and cylinder radius, plus
+Start / Pause / Reset / Stop buttons. On Linux you may need
+`sudo apt install -y python3-tk` for tkinter.
+
 ### Vispy controls
 
 | Key / Mouse    | Action           |
@@ -184,6 +194,7 @@ at the top of each script.
     ├── yarn_cylinder_friction_vispy.py     # + Coulomb friction
     ├── yarn_plane_friction_vispy.py        # yarn on tilted plane + friction
     ├── yarn_cylinder_ogc_vispy.py          # cylinder collision via OGC pipeline
+    ├── yarn_cylinder_ogc_gui.py            # OGC demo + Tkinter control panel (multiproc)
     └── ogc/                                # OGC (SIGGRAPH 2025) modules
         ├── mesh.py                         # triangulated-mesh + feature normals
         ├── algorithm1.py                   # Vertex-Facet contact detection (Warp)
