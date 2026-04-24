@@ -1,0 +1,13 @@
+# Core — required for the physics engine
+warp-lang
+numpy
+
+# Default viewer (main.py) + matplotlib examples
+matplotlib
+
+# Vispy examples (examples/*_vispy.py)
+vispy
+PyQt5
+
+# Polyscope examples (examples/yarn_freefall.py, examples/yarn_wind_sway.py)
+polyscope
