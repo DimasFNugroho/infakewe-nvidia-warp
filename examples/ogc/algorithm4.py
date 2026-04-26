@@ -135,12 +135,10 @@ def kernel_vf_friction(
         |Δx_T| ≤ μ_s · correction_n   →  static:  cancel Δx_T entirely
         |Δx_T| >  μ_s · correction_n   →  kinetic: scale back to μ_k · correction_n
 
-    correction_n uses r as a fixed reference rather than the instantaneous
-    penetration depth (r - vf_dist).  When a particle rests on the surface
-    its penetration depth is near zero, which would make the Coulomb cone
-    vanishingly small and friction disappear even at μ = 1.  Using r as the
-    reference keeps the cone proportional to the contact radius at all depths,
-    so μ_static = 1.0 reliably prevents tangential sliding.
+    correction_n = max(r - vf_dist, r/2): uses the penetration depth as the
+    cone reference, floored at half the contact radius so that settled
+    particles (penetration ≈ 0 when dist ≈ r) still get a non-degenerate
+    cone and μ values remain visually significant across the full slider range.
     """
     i = wp.tid()
     if inv_mass[i] == 0.0:
@@ -150,15 +148,17 @@ def kernel_vf_friction(
     if vf_dist[i] >= r:
         return
 
-    correction_n = r   # fixed reference — see docstring
+    # Coulomb cone reference = penetration depth, floored at r/2 so that
+    # settled particles (penetration ≈ 0 when vf_dist ≈ r) still get a
+    # non-degenerate cone and mu values remain visually significant.
+    penetration  = r - vf_dist[i]
+    correction_n = wp.max(penetration, r * float(0.5))
 
     n       = vf_normal[i]
     delta   = pos[i] - prev_pos[i]
     delta_t = delta - n * wp.dot(delta, n)
     len_t   = wp.length(delta_t)
 
-    # 1e-12 is below float32 noise for typical metre-scale positions (~1e-7),
-    # making correction_n / len_t explode into the billions.  1e-6 is safe.
     if len_t < 1.0e-6:
         return
 
@@ -169,6 +169,79 @@ def kernel_vf_friction(
         # ratio overshoots 1 and reverses motion, ping-ponging each substep.
         scale = wp.min(mu_k * correction_n / len_t, float(1.0))
         pos[i] = pos[i] - delta_t * scale                                # kinetic
+
+
+# ── Kernel: Coulomb friction at edge-edge contact ────────────────────────────
+
+@wp.kernel
+def kernel_ee_friction(
+    pos:        wp.array(dtype=wp.vec3),
+    prev_pos:   wp.array(dtype=wp.vec3),
+    inv_mass:   wp.array(dtype=float),
+    yarn_edges: wp.array(dtype=wp.vec2i),
+    parity:     int,
+    ee_active:  wp.array(dtype=int),
+    ee_dist:    wp.array(dtype=float),
+    ee_normal:  wp.array(dtype=wp.vec3),
+    ee_s:       wp.array(dtype=float),
+    r:          float,
+    mu_s:       float,
+    mu_k:       float,
+):
+    """Coulomb friction for edge-edge contacts (same cone rule as VF, per-edge).
+
+    The contact point on the yarn moves tangentially by the barycentric
+    interpolation of the two endpoint displacements.  The same Coulomb
+    cone correction is distributed back to the endpoints by the same
+    barycentric weights used in kernel_ee_project.
+    """
+    i = wp.tid()
+    if (i & 1) != parity:
+        return
+    if ee_active[i] == 0:
+        return
+    if ee_dist[i] >= r:
+        return
+
+    penetration  = r - ee_dist[i]
+    correction_n = wp.max(penetration, r * float(0.5))
+
+    ev = yarn_edges[i]
+    wa = inv_mass[ev[0]]
+    wb = inv_mass[ev[1]]
+    wt = wa + wb
+    if wt < 1.0e-12:
+        return
+
+    s  = ee_s[i]
+    ca = float(1.0) - s
+    cb = s
+
+    # Tangential displacement of the yarn contact point since substep start.
+    cp_now  = pos[ev[0]]  * ca + pos[ev[1]]  * cb
+    cp_prev = prev_pos[ev[0]] * ca + prev_pos[ev[1]] * cb
+    delta   = cp_now - cp_prev
+    n       = ee_normal[i]
+    delta_t = delta - n * wp.dot(delta, n)
+    len_t   = wp.length(delta_t)
+
+    if len_t < 1.0e-6:
+        return
+
+    if len_t <= mu_s * correction_n:
+        scale = float(1.0)                                               # static
+    else:
+        scale = wp.min(mu_k * correction_n / len_t, float(1.0))         # kinetic
+
+    correction = -delta_t * scale
+
+    # Distribute correction to endpoints by barycentric / inverse-mass weighting.
+    w_denom = ca * ca * wa + cb * cb * wb
+    if w_denom < 1.0e-12:
+        return
+
+    pos[ev[0]] = pos[ev[0]] + correction * (ca * wa / w_denom)
+    pos[ev[1]] = pos[ev[1]] + correction * (cb * wb / w_denom)
 
 
 # ── Kernel: velocity magnitude clamp ─────────────────────────────────────────
@@ -301,6 +374,27 @@ def apply_vf_friction(
                 vf.active, vf.dist, vf.normal,
                 r, mu_s, mu_k],
     )
+
+
+def apply_ee_friction(
+    pos:        wp.array,
+    prev_pos:   wp.array,
+    inv_mass:   wp.array,
+    yarn_edges: wp.array,
+    ee,         # EEContacts
+    r:          float,
+    mu_s:       float,
+    mu_k:       float,
+    device:     str,
+):
+    n = yarn_edges.shape[0]
+    for parity in (0, 1):
+        wp.launch(
+            kernel_ee_friction, dim=n, device=device,
+            inputs=[pos, prev_pos, inv_mass, yarn_edges, parity,
+                    ee.active, ee.dist, ee.normal, ee.s,
+                    r, mu_s, mu_k],
+        )
 
 
 def project_ee(

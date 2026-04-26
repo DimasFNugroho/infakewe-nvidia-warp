@@ -39,7 +39,7 @@ from kernels import (
 from .mesh import OGCMesh
 from .algorithm1 import ObstacleGPU, VFContacts, detect_vertex_facet
 from .algorithm2 import EEContacts, detect_edge_edge
-from .algorithm4 import project_vf, project_ee, apply_vf_friction, damp_normal_velocity, clamp_velocity
+from .algorithm4 import project_vf, project_ee, apply_vf_friction, apply_ee_friction, damp_normal_velocity, clamp_velocity
 
 
 class OGCSimulation:
@@ -124,6 +124,8 @@ class OGCSimulation:
             # One friction pass per substep, using the converged position.
             apply_vf_friction(self.pos, self.prev_pos, self.inv_mass, self.vf,
                               self.r, self.mu_static, self.mu_kinetic, self.device)
+            apply_ee_friction(self.pos, self.prev_pos, self.inv_mass, self.yarn_edges,
+                              self.ee, self.r, self.mu_static, self.mu_kinetic, self.device)
 
             # Velocity update from position delta
             self._correct_velocity(inv_sdt)
