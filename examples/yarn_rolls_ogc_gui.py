@@ -50,6 +50,7 @@ DEFAULTS = {
     "roll_a_y":          0.0,
     "roll_a_z":          0.0,
     "roll_a_radius":     0.15,
+    "roll_a_mass":       0.5,    # kg — sets rotational inertia of roll A
     # Roll B — pulling roll
     "roll_b_x":          0.8,
     "roll_b_y":          0.0,
@@ -118,18 +119,24 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     frame    = [0]
     sim_time = [0.0]
     angle_b  = [0.0]   # current winding angle of particle N-1 on roll B (rad)
+    angle_a  = [0.0]   # current rotation angle of roll A (rad)
+    omega_a  = [0.0]   # roll A angular velocity (rad/s)
 
     # ── Geometry helpers ──────────────────────────────────────────────────────
 
-    def roll_a_attach() -> np.ndarray:
-        """Point on roll A surface facing roll B."""
-        ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
-        bx, by     = state["roll_b_x"], state["roll_b_y"]
-        dx, dy     = bx - ax, by - ay
-        dist       = max((dx**2 + dy**2) ** 0.5, 1e-6)
-        ra         = float(state["roll_a_radius"])
-        return np.array([ax + ra * dx / dist, ay + ra * dy / dist, az],
-                        dtype=np.float32)
+    def _n_wrap() -> int:
+        """Number of particles wound around roll A (≈ one full circumference)."""
+        ra = max(float(state["roll_a_radius"]), 1e-6)
+        return max(2, min(int(round(2.0 * np.pi * ra / config.REST_LEN)), N // 2))
+
+    def init_angle_a() -> float:
+        """Initial angle of particle 0 on roll A so the departure faces roll B."""
+        ax, ay = state["roll_a_x"], state["roll_a_y"]
+        bx, by = state["roll_b_x"], state["roll_b_y"]
+        depart = float(np.arctan2(by - ay, bx - ax))
+        ra     = max(float(state["roll_a_radius"]), 1e-6)
+        n      = _n_wrap()
+        return depart - (n - 1) * config.REST_LEN / ra
 
     def roll_b_attach(angle: float) -> np.ndarray:
         """Point on roll B surface at the given winding angle."""
@@ -145,11 +152,28 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         return float(np.arctan2(ay - by, ax - bx))
 
     def make_initial_positions() -> np.ndarray:
-        """Straight line from roll A attachment to roll B attachment."""
-        p0 = roll_a_attach()
-        pN = roll_b_attach(angle_b[0])
-        return np.array([p0 + (pN - p0) * i / (N - 1) for i in range(N)],
-                        dtype=np.float32)
+        """Yarn wound one full loop around roll A then straight to roll B."""
+        ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
+        ra         = max(float(state["roll_a_radius"]), 1e-6)
+        dtheta     = config.REST_LEN / ra
+        n_wrap     = _n_wrap()
+
+        positions: list = []
+        # Wound section — particle 0 is the innermost (most wound) point
+        for i in range(n_wrap):
+            theta = angle_a[0] + i * dtheta
+            positions.append([ax + ra * np.cos(theta),
+                               ay + ra * np.sin(theta), az])
+
+        # Free span — from departure point linearly to roll B
+        p_dep  = np.array(positions[-1], dtype=np.float32)
+        p_end  = roll_b_attach(angle_b[0])
+        n_free = N - n_wrap
+        for i in range(1, n_free + 1):
+            t = i / n_free
+            positions.append(list(p_dep + t * (p_end - p_dep)))
+
+        return np.array(positions[:N], dtype=np.float32)
 
     def make_inv_mass() -> np.ndarray:
         m = max(float(state["particle_mass"]), 1e-6)
@@ -163,6 +187,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     device = "cuda" if wp.is_cuda_available() else "cpu"
 
     angle_b[0] = init_angle_b()
+    angle_a[0] = init_angle_a()
 
     # ── Build obstacle meshes + GPU objects ───────────────────────────────────
     def _cyl(sx, sy, sz, sr):
@@ -224,6 +249,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     def sim_reset():
         angle_b[0] = init_angle_b()
+        angle_a[0] = init_angle_a()
+        omega_a[0] = 0.0
         pos0 = make_initial_positions()
         pos_wp.assign(wp.array(pos0,                              dtype=wp.vec3, device=device))
         prev_pos_wp.assign(wp.array(pos0.copy(),                  dtype=wp.vec3, device=device))
@@ -241,29 +268,62 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         mu_k      = float(state["mu_kinetic"])
         v_max     = float(state["v_max"])
         zero_wind = wp.vec3(0.0, 0.0, 0.0)
-        p0        = roll_a_attach()          # fixed for the whole frame
+
+        ax, ay, az  = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
+        ra          = max(float(state["roll_a_radius"]), 1e-6)
+        M_a         = max(float(state["roll_a_mass"]), 1e-3)
+        I_a         = 0.5 * M_a * ra * ra           # solid-cylinder inertia
+        particle_m  = max(float(state["particle_mass"]), 1e-6)
 
         for _ in range(config.SUBSTEPS):
-            # Advance roll B winding angle and move particle N-1.
+            # ── Roll A dynamics (torque from yarn tension in segment 0→1) ─────
+            pos_np = pos_wp.numpy()
+
+            p0    = pos_np[0].astype(np.float64)
+            p1    = pos_np[1].astype(np.float64)
+            vec01 = p1 - p0
+            len01 = float(np.linalg.norm(vec01))
+            if len01 > 1e-6:
+                stretch     = max(0.0, len01 - float(config.REST_LEN))
+                # PBD-implied tension: F ≈ m * stretch / dt²
+                tension_mag = (particle_m / (sub_dt * sub_dt)) * stretch * float(state["stretch_stiff"])
+                t_hat       = vec01 / len01
+                r_vec       = p0 - np.array([ax, ay, az], dtype=np.float64)
+                torque_z    = float(r_vec[0] * tension_mag * t_hat[1]
+                                    - r_vec[1] * tension_mag * t_hat[0])
+            else:
+                torque_z = 0.0
+
+            omega_a[0] *= 0.98                              # light bearing damping
+            omega_a[0] += torque_z / I_a * sub_dt
+            omega_a[0]  = max(-200.0, min(200.0, omega_a[0]))
+            angle_a[0] += omega_a[0] * sub_dt
+
+            p0_new = np.array([ax + ra * np.cos(angle_a[0]),
+                               ay + ra * np.sin(angle_a[0]), az], dtype=np.float32)
+
+            # ── Roll B advance ────────────────────────────────────────────────
             rb = max(float(state["roll_b_radius"]), 1e-6)
             angle_b[0] += float(state["pull_speed"]) * sub_dt / rb
             pN = roll_b_attach(angle_b[0])
 
-            set_particle(0,  p0)
-            set_particle(-1, pN)
+            # ── Write kinematic endpoints (one GPU round-trip) ────────────────
+            pos_np[0]  = p0_new
+            pos_np[-1] = np.array(pN, dtype=np.float32)
+            pos_wp.assign(wp.array(pos_np, dtype=wp.vec3, device=device))
 
-            # Predict free particles (kernel respects inv_mass == 0).
+            # ── Predict ───────────────────────────────────────────────────────
             wp.launch(kernel_integrate, dim=N, device=device,
                       inputs=[pos_wp, vel_wp, prev_pos_wp, inv_mass_wp,
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
 
-            # Detect contacts for all three obstacles.
+            # ── Contact detection ─────────────────────────────────────────────
             for obs, vf, ee in contacts:
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
 
-            # Inner PBD iterations.
-            for _ in range(config.CONSTRAINT_ITER):
+            # ── Inner PBD iterations ──────────────────────────────────────────
+            for _k in range(config.CONSTRAINT_ITER):
                 wp.launch(kernel_stretch_even, dim=n_even, device=device,
                           inputs=[pos_wp, inv_mass_wp, config.REST_LEN, config.STRETCH_STIFF])
                 wp.launch(kernel_stretch_odd,  dim=n_odd,  device=device,
@@ -274,14 +334,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                     project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
                     project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
 
-            # Friction.
+            # ── Friction ──────────────────────────────────────────────────────
             for obs, vf, ee in contacts:
                 apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   vf, r, mu_s, mu_k, device)
                 apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   yarn_edges_wp, ee, r, mu_s, mu_k, device)
 
-            # Velocity update + normal damping + speed clamp.
+            # ── Velocity update ───────────────────────────────────────────────
             wp.launch(kernel_update_velocity, dim=N, device=device,
                       inputs=[pos_wp, prev_pos_wp, vel_wp, inv_mass_wp, inv_sdt])
             for obs, vf, ee in contacts:
@@ -398,7 +458,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         hud.text = (
             f"[{device}]  frame {frame[0]:05d}  {status}  t={sim_time[0]:.2f}s\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
-            f"angle_B={np.degrees(angle_b[0]):.1f}°\n"
+            f"ωA={omega_a[0]:+.1f} rad/s  θA={np.degrees(angle_a[0]):.0f}°\n"
             f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
             f"iter={config.CONSTRAINT_ITER}"
         )
@@ -493,11 +553,12 @@ def run_ui(cmd_queue):
     add_slider("Friction μ_kinetic",   "mu_kinetic",   0.0,   1.0,  DEFAULTS["mu_kinetic"])
     add_slider("Velocity max (m/s)",   "v_max",        0.0,  100.0, DEFAULTS["v_max"],       fmt="{:.1f}")
 
-    section("Roll A — feeding roll")
-    add_slider("Roll A  X",      "roll_a_x",      -3.0,  3.0, DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
-    add_slider("Roll A  Y",      "roll_a_y",      -3.0,  3.0, DEFAULTS["roll_a_y"],      fmt="{:+.3f}")
-    add_slider("Roll A  Z",      "roll_a_z",      -3.0,  3.0, DEFAULTS["roll_a_z"],      fmt="{:+.3f}")
-    add_slider("Roll A  radius", "roll_a_radius",  0.02, 0.5, DEFAULTS["roll_a_radius"])
+    section("Roll A — feeding roll (freely rotating)")
+    add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
+    add_slider("Roll A  Y",       "roll_a_y",      -3.0,  3.0,  DEFAULTS["roll_a_y"],      fmt="{:+.3f}")
+    add_slider("Roll A  Z",       "roll_a_z",      -3.0,  3.0,  DEFAULTS["roll_a_z"],      fmt="{:+.3f}")
+    add_slider("Roll A  radius",  "roll_a_radius",  0.02, 0.5,  DEFAULTS["roll_a_radius"])
+    add_slider("Roll A  mass (kg)", "roll_a_mass",  0.01, 5.0,  DEFAULTS["roll_a_mass"])
 
     section("Roll B — pulling roll")
     add_slider("Roll B  X",      "roll_b_x",      -3.0,  3.0, DEFAULTS["roll_b_x"],      fmt="{:+.3f}")
