@@ -36,14 +36,24 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULTS = {
     "gravity_y":        -9.81,
-    "damping":           0.998,
+    "particle_mass":     0.01,
+    "damping":           0.996,
     "stretch_stiff":     1.0,
-    "bend_stiff":        0.25,
+    "bend_stiff":        0.0,
     "substeps":          20,
-    "constraint_iter":   10,
-    "ogc_r":             0.02,
+    "constraint_iter":   1,
+    "ogc_r":             0.005,
     "ogc_stiff":         1.0,
-    "cyl_radius":        0.22,
+    "mu_static":         0.4,
+    "mu_kinetic":        0.2,
+    "v_max":             20.0,
+    "cyl_radius":        0.05,
+    "cyl_x":             1.0,
+    "cyl_y":            -0.55,
+    "cyl_z":             0.0,
+    "yarn_x":            0.0,
+    "yarn_y":            0.0,
+    "yarn_z":            0.0,
 }
 
 
@@ -56,6 +66,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     sys.path.insert(0, script_dir)                        # → ogc package
 
     import queue as py_queue
+    import numpy as np
     import warp as wp
     from vispy import app, scene
     from vispy.scene import visuals
@@ -65,15 +76,25 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     from ogc.algorithm1 import ObstacleGPU
     from ogc.algorithm3 import OGCSimulation
 
-    # ── Scene constants (cylinder position fixed; radius is a live slider) ───
-    CYL_CENTER = (1.0, -0.55, 0.0)
+    # ── Scene constants ───────────────────────────────────────────────────────
     CYL_HALF_H = 1.5
     CYL_N_SEGS = 48
     BG_COL     = (0.07, 0.07, 0.13, 1.0)
-    YARN_COL   = (0.91, 0.27, 0.38)
     ANCHOR_COL = (0.0,  0.83, 1.0)
     FREE_COL   = (1.0,  0.65, 0.0)
     CYL_COL    = (0.25, 0.70, 0.45, 0.75)
+
+    STRIPE_SIZE    = 5
+    STRIPE_PALETTE = np.array([
+        [0.95, 0.25, 0.35, 1.0],   # red
+        [0.98, 0.80, 0.12, 1.0],   # gold
+        [0.18, 0.82, 0.95, 1.0],   # cyan
+        [0.65, 0.40, 0.95, 1.0],   # violet
+    ], dtype=np.float32)
+
+    def make_yarn_colors(n):
+        idx = (np.arange(n) // STRIPE_SIZE) % len(STRIPE_PALETTE)
+        return STRIPE_PALETTE[idx]
 
     # ── Mutable state ────────────────────────────────────────────────────────
     state   = dict(defaults)
@@ -82,7 +103,10 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     # ── Init Warp + sim ──────────────────────────────────────────────────────
     wp.init()
-    cyl = build_cylinder(*CYL_CENTER, state["cyl_radius"], CYL_HALF_H, n_segs=CYL_N_SEGS)
+    cyl = build_cylinder(
+        state["cyl_x"], state["cyl_y"], state["cyl_z"],
+        state["cyl_radius"], CYL_HALF_H, n_segs=CYL_N_SEGS,
+    )
     sim = OGCSimulation(
         obstacle_mesh     = cyl,
         contact_radius    = state["ogc_r"],
@@ -92,6 +116,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     def apply_state():
         """Push slider values into config + sim so the next step() uses them."""
         config.GRAVITY         = wp.vec3(0.0, float(state["gravity_y"]), 0.0)
+        sim.particle_mass      = float(state["particle_mass"])
         config.DAMPING         = float(state["damping"])
         config.STRETCH_STIFF   = float(state["stretch_stiff"])
         config.BEND_STIFF      = float(state["bend_stiff"])
@@ -99,6 +124,9 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         config.CONSTRAINT_ITER = int(state["constraint_iter"])
         sim.r                  = float(state["ogc_r"])
         sim.contact_stiffness  = float(state["ogc_stiff"])
+        sim.mu_static          = float(state["mu_static"])
+        sim.mu_kinetic         = float(state["mu_kinetic"])
+        sim.v_max              = float(state["v_max"])
 
     apply_state()
 
@@ -129,8 +157,9 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     )
 
     p = sim.positions()
+    yarn_colors = make_yarn_colors(p.shape[0])
     yarn_line = visuals.Line(
-        pos=p, color=YARN_COL, width=3, connect="strip", parent=view.scene,
+        pos=p, color=yarn_colors, width=3, connect="strip", parent=view.scene,
     )
     anchor   = visuals.Markers(parent=view.scene)
     free_end = visuals.Markers(parent=view.scene)
@@ -142,16 +171,22 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         parent=canvas.scene, pos=(10, 20),
     )
 
-    last_cyl_r = [state["cyl_radius"]]
+    last_cyl_r   = [state["cyl_radius"]]
+    last_cyl_pos = [state["cyl_x"], state["cyl_y"], state["cyl_z"]]
 
-    def rebuild_obstacle(new_radius: float):
+    def rebuild_obstacle():
         """Replace the cylinder mesh and the GPU obstacle arrays."""
-        new_mesh = build_cylinder(*CYL_CENTER, float(new_radius), CYL_HALF_H,
-                                  n_segs=CYL_N_SEGS)
+        new_mesh = build_cylinder(
+            float(state["cyl_x"]), float(state["cyl_y"]), float(state["cyl_z"]),
+            float(state["cyl_radius"]), CYL_HALF_H, n_segs=CYL_N_SEGS,
+        )
         sim.obstacle = ObstacleGPU(new_mesh, sim.device)
         vv, ff = mesh_for_render(new_mesh)
         cyl_visual.set_data(vertices=vv, faces=ff, color=CYL_COL)
-        last_cyl_r[0] = float(new_radius)
+        last_cyl_r[0]   = float(state["cyl_radius"])
+        last_cyl_pos[0] = float(state["cyl_x"])
+        last_cyl_pos[1] = float(state["cyl_y"])
+        last_cyl_pos[2] = float(state["cyl_z"])
 
     # ── Main tick: drain queue, step sim, update visuals ─────────────────────
     def on_timer(_event):
@@ -173,7 +208,16 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                     key, value = cmd[1], cmd[2]
                     state[key] = value
                     if key == "cyl_radius" and abs(float(value) - last_cyl_r[0]) > 1e-4:
-                        rebuild_obstacle(value)
+                        rebuild_obstacle()
+                    elif key in ("cyl_x", "cyl_y", "cyl_z"):
+                        rebuild_obstacle()
+                    elif key in ("yarn_x", "yarn_y", "yarn_z"):
+                        sim.yarn_origin = np.array(
+                            [state["yarn_x"], state["yarn_y"], state["yarn_z"]],
+                            dtype=np.float32,
+                        )
+                        sim.reset()
+                        frame[0] = 0
                     apply_state()
         except py_queue.Empty:
             pass
@@ -212,22 +256,27 @@ def run_ui(cmd_queue):
 
     root = tk.Tk()
     root.title("OGC yarn–cylinder — controls")
-    root.geometry("440x560")
+    root.geometry("460x870")
 
     def add_slider(label, key, from_, to_, default, is_int=False, fmt="{:.3f}"):
         frm = ttk.Frame(root)
         frm.pack(fill="x", padx=8, pady=4)
-        ttk.Label(frm, text=label, width=18).pack(side="left")
+        ttk.Label(frm, text=label, width=20).pack(side="left")
 
         val_var  = tk.DoubleVar(value=default)
-        disp_var = tk.StringVar(value=(str(int(default)) if is_int else fmt.format(default)))
-        ttk.Label(frm, textvariable=disp_var, width=8).pack(side="right")
+        # Int sliders show  "current / max"  so the ceiling is always visible.
+        if is_int:
+            init_disp = f"{int(default)} / {int(to_)}"
+        else:
+            init_disp = fmt.format(default)
+        disp_var = tk.StringVar(value=init_disp)
+        ttk.Label(frm, textvariable=disp_var, width=10).pack(side="right")
 
         def on_change(v):
             if is_int:
                 iv = int(round(float(v)))
                 val_var.set(iv)
-                disp_var.set(str(iv))
+                disp_var.set(f"{iv} / {int(to_)}")
                 cmd_queue.put(("param", key, iv))
             else:
                 fv = float(v)
@@ -242,18 +291,30 @@ def run_ui(cmd_queue):
 
     ttk.Label(root, text="Physics", font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 0))
     add_slider("Gravity Y",        "gravity_y",      -20.0, 0.0,  DEFAULTS["gravity_y"],   fmt="{:+.2f}")
+    add_slider("Particle mass (kg)","particle_mass",   0.01, 10.0, DEFAULTS["particle_mass"], fmt="{:.3f}")
     add_slider("Damping",          "damping",         0.90, 1.00, DEFAULTS["damping"])
     add_slider("Stretch stiff",    "stretch_stiff",   0.0,  1.0,  DEFAULTS["stretch_stiff"])
     add_slider("Bend stiff",       "bend_stiff",      0.0,  1.0,  DEFAULTS["bend_stiff"])
-    add_slider("Substeps",         "substeps",        1,    50,   DEFAULTS["substeps"],        is_int=True)
-    add_slider("Constraint iter",  "constraint_iter", 1,    30,   DEFAULTS["constraint_iter"], is_int=True)
+    add_slider("Substeps",         "substeps",        1,   200,   DEFAULTS["substeps"],        is_int=True)
+    add_slider("Constraint iter",  "constraint_iter", 1,    50,   DEFAULTS["constraint_iter"], is_int=True)
 
     ttk.Label(root, text="OGC contact", font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 0))
-    add_slider("Contact radius r", "ogc_r",           0.005, 0.20, DEFAULTS["ogc_r"])
+    add_slider("Contact radius r (m)", "ogc_r",        0.001, 0.20, DEFAULTS["ogc_r"], fmt="{:.4f}")
     add_slider("Contact stiffness","ogc_stiff",       0.0,   1.0,  DEFAULTS["ogc_stiff"])
+    add_slider("Friction μ_static", "mu_static",      0.0,   1.0,  DEFAULTS["mu_static"])
+    add_slider("Friction μ_kinetic","mu_kinetic",      0.0,   1.0,  DEFAULTS["mu_kinetic"])
+    add_slider("Velocity max (m/s)","v_max",           0.0,  100.0, DEFAULTS["v_max"],    fmt="{:.1f}")
 
     ttk.Label(root, text="Obstacle", font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 0))
-    add_slider("Cylinder radius",  "cyl_radius",      0.05,  0.50, DEFAULTS["cyl_radius"])
+    add_slider("Cylinder radius (m)","cyl_radius",     0.02,  0.50, DEFAULTS["cyl_radius"])
+    add_slider("Cylinder X",         "cyl_x",         -3.0,   3.0,  DEFAULTS["cyl_x"],  fmt="{:+.3f}")
+    add_slider("Cylinder Y",         "cyl_y",         -3.0,   3.0,  DEFAULTS["cyl_y"],  fmt="{:+.3f}")
+    add_slider("Cylinder Z",         "cyl_z",         -3.0,   3.0,  DEFAULTS["cyl_z"],  fmt="{:+.3f}")
+
+    ttk.Label(root, text="Yarn origin", font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 0))
+    add_slider("Origin X",           "yarn_x",        -3.0,   3.0,  DEFAULTS["yarn_x"], fmt="{:+.3f}")
+    add_slider("Origin Y",           "yarn_y",        -3.0,   3.0,  DEFAULTS["yarn_y"], fmt="{:+.3f}")
+    add_slider("Origin Z",           "yarn_z",        -3.0,   3.0,  DEFAULTS["yarn_z"], fmt="{:+.3f}")
 
     # ── Buttons ──────────────────────────────────────────────────────────────
     def send(cmd: str):

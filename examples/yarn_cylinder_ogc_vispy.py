@@ -61,10 +61,26 @@ OGC_CONTACT_STIFFNESS = 1.0
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BG_COL     = (0.07, 0.07, 0.13, 1.0)
-YARN_COL   = (0.91, 0.27, 0.38)
 ANCHOR_COL = (0.0,  0.83, 1.0)
 FREE_COL   = (1.0,  0.65, 0.0)
 CYL_COL    = (0.25, 0.70, 0.45, 0.75)
+
+# Repeating stripe palette — each band is STRIPE_SIZE consecutive particles.
+# Fixed to particle index so you can track individual segments visually.
+STRIPE_SIZE    = 5
+STRIPE_PALETTE = np.array([
+    [0.95, 0.25, 0.35, 1.0],   # red
+    [0.98, 0.80, 0.12, 1.0],   # gold
+    [0.18, 0.82, 0.95, 1.0],   # cyan
+    [0.65, 0.40, 0.95, 1.0],   # violet
+], dtype=np.float32)
+
+
+def make_yarn_colors(n: int) -> np.ndarray:
+    """Return (n, 4) RGBA per-vertex colour array with repeating stripes."""
+    palette_n = len(STRIPE_PALETTE)
+    idx = (np.arange(n) // STRIPE_SIZE) % palette_n
+    return STRIPE_PALETTE[idx]
 
 
 # ── Vispy visualizer ──────────────────────────────────────────────────────────
@@ -103,8 +119,10 @@ class CylinderOGCVispy:
 
         # ── Yarn ──────────────────────────────────────────────────────────────
         p = self.sim.positions()
+        self._yarn_colors = make_yarn_colors(p.shape[0])
         self._yarn = visuals.Line(
-            pos=p, color=YARN_COL, width=3, connect="strip", parent=view.scene,
+            pos=p, color=self._yarn_colors, width=3,
+            connect="strip", parent=view.scene,
         )
         self._anchor   = visuals.Markers(parent=view.scene)
         self._free_end = visuals.Markers(parent=view.scene)

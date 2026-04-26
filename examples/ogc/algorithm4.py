@@ -112,6 +112,125 @@ def kernel_ee_project(
     pos[ev[1]] = pos[ev[1]] + delta * (cb * wb / w_denom)
 
 
+# ── Kernel: Coulomb friction at vertex-facet contact ─────────────────────────
+
+@wp.kernel
+def kernel_vf_friction(
+    pos:       wp.array(dtype=wp.vec3),
+    prev_pos:  wp.array(dtype=wp.vec3),
+    inv_mass:  wp.array(dtype=float),
+    vf_active: wp.array(dtype=int),
+    vf_dist:   wp.array(dtype=float),
+    vf_normal: wp.array(dtype=wp.vec3),
+    r:         float,
+    mu_s:      float,
+    mu_k:      float,
+):
+    """Position-based Coulomb friction (Müller et al. 2007, Sec. 3.3).
+
+    For each contacting particle, the tangential displacement since substep
+    start (pos - prev_pos projected onto the tangent plane of the contact
+    normal) is clamped by the Coulomb cone:
+
+        |Δx_T| ≤ μ_s · correction_n   →  static:  cancel Δx_T entirely
+        |Δx_T| >  μ_s · correction_n   →  kinetic: scale back to μ_k · correction_n
+
+    correction_n uses r as a fixed reference rather than the instantaneous
+    penetration depth (r - vf_dist).  When a particle rests on the surface
+    its penetration depth is near zero, which would make the Coulomb cone
+    vanishingly small and friction disappear even at μ = 1.  Using r as the
+    reference keeps the cone proportional to the contact radius at all depths,
+    so μ_static = 1.0 reliably prevents tangential sliding.
+    """
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    if vf_active[i] == 0:
+        return
+    if vf_dist[i] >= r:
+        return
+
+    correction_n = r   # fixed reference — see docstring
+
+    n       = vf_normal[i]
+    delta   = pos[i] - prev_pos[i]
+    delta_t = delta - n * wp.dot(delta, n)
+    len_t   = wp.length(delta_t)
+
+    # 1e-12 is below float32 noise for typical metre-scale positions (~1e-7),
+    # making correction_n / len_t explode into the billions.  1e-6 is safe.
+    if len_t < 1.0e-6:
+        return
+
+    if len_t <= mu_s * correction_n:
+        pos[i] = pos[i] - delta_t                                        # static
+    else:
+        # Clamp scale to 1.0: if mu_k > mu_s (user error via slider) the
+        # ratio overshoots 1 and reverses motion, ping-ponging each substep.
+        scale = wp.min(mu_k * correction_n / len_t, float(1.0))
+        pos[i] = pos[i] - delta_t * scale                                # kinetic
+
+
+# ── Kernel: velocity magnitude clamp ─────────────────────────────────────────
+
+@wp.kernel
+def kernel_clamp_velocity(
+    vel:   wp.array(dtype=wp.vec3),
+    v_max: float,
+):
+    """Hard-cap particle speed to prevent PBD constraint corrections from
+    feeding back into runaway velocities.
+
+    In PBD, velocity is derived as  v = (x_after_constraints - x_prev) / dt,
+    so large constraint corrections (stretch snap, contact projection) appear
+    as large velocities that overshoot even further next substep — a positive
+    feedback loop that explodes.  Clamping speed breaks the loop without
+    altering direction, so the simulation remains physically plausible.
+
+    A value of 0.0 disables the clamp.
+    """
+    i = wp.tid()
+    if v_max <= 0.0:
+        return
+    v_mag = wp.length(vel[i])
+    if v_mag > v_max:
+        vel[i] = vel[i] * (v_max / v_mag)
+
+
+# ── Kernel: contact normal-velocity damping ───────────────────────────────────
+
+@wp.kernel
+def kernel_vf_damp_normal_velocity(
+    vel:       wp.array(dtype=wp.vec3),
+    inv_mass:  wp.array(dtype=float),
+    vf_active: wp.array(dtype=int),
+    vf_dist:   wp.array(dtype=float),
+    vf_normal: wp.array(dtype=wp.vec3),
+    r:         float,
+    skin:      float,
+):
+    """Zero the inward-normal velocity component for particles on the offset surface.
+
+    A particle is "in contact" when vf_active == 1 and its distance to the
+    closest obstacle feature is within  r + skin.  For those particles, the
+    velocity component pointing back toward the obstacle (negative dot with the
+    outward feature normal) is removed — leaving tangential motion intact.
+    """
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    if vf_active[i] == 0:
+        return
+    if vf_dist[i] > r + skin:
+        return
+
+    n      = vf_normal[i]
+    v      = vel[i]
+    v_inward = wp.dot(v, n)
+    if v_inward < 0.0:
+        vel[i] = v - n * v_inward
+
+
 # ── Python entry point ────────────────────────────────────────────────────────
 
 def project_vf(
@@ -125,6 +244,62 @@ def project_vf(
     wp.launch(
         kernel_vf_project, dim=pos.shape[0], device=device,
         inputs=[pos, inv_mass, vf.active, vf.cp, vf.dist, vf.normal, r, stiffness],
+    )
+
+
+def damp_normal_velocity(
+    vel:      wp.array,
+    inv_mass: wp.array,
+    vf,       # VFContacts
+    r:        float,
+    device:   str,
+):
+    """Cancel the inward normal velocity for particles resting on the offset surface.
+
+    PBD contact projection repositions a particle each substep, but the
+    velocity update  v = (x - x_prev)/dt  then treats that displacement as
+    outward velocity.  On the next substep gravity drives the particle back
+    in, the contact fires again, and a low-frequency normal oscillation
+    (wiggling) builds up.  Zeroing the component of v that points *against*
+    the feature normal (i.e. back into the obstacle) kills this loop — the
+    same trick used in kernel_cylinder_contact_damping in the analytic example.
+
+    The `skin` band is 0.5 * r beyond the offset surface so that particles
+    that have just settled are caught even if numerical drift pushed them
+    slightly outside r.
+    """
+    wp.launch(
+        kernel_vf_damp_normal_velocity, dim=vel.shape[0], device=device,
+        inputs=[vel, inv_mass, vf.active, vf.dist, vf.normal, r, float(r * 0.5)],
+    )
+
+
+def clamp_velocity(
+    vel:    wp.array,
+    v_max:  float,
+    device: str,
+):
+    wp.launch(
+        kernel_clamp_velocity, dim=vel.shape[0], device=device,
+        inputs=[vel, float(v_max)],
+    )
+
+
+def apply_vf_friction(
+    pos:      wp.array,
+    prev_pos: wp.array,
+    inv_mass: wp.array,
+    vf,       # VFContacts
+    r:        float,
+    mu_s:     float,
+    mu_k:     float,
+    device:   str,
+):
+    wp.launch(
+        kernel_vf_friction, dim=pos.shape[0], device=device,
+        inputs=[pos, prev_pos, inv_mass,
+                vf.active, vf.dist, vf.normal,
+                r, mu_s, mu_k],
     )
 
 
