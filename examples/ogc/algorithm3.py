@@ -66,8 +66,9 @@ class OGCSimulation:
         self._n_odd  = (n - 1) // 2
         self._n_bend = n - 2
 
-        # ── Initial yarn state: horizontal line along X, left end pinned ──────
+        # ── Initial yarn state: straight line from origin toward end, left end pinned ──
         self.yarn_origin = np.zeros(3, dtype=np.float32)
+        self.yarn_end    = np.array([config.YARN_LENGTH, 0.0, 0.0], dtype=np.float32)
         pos_np, vel_np = self._initial_arrays()
         self._particle_mass = 1.0
         inv_mass_np         = self._make_inv_mass(self._particle_mass, n)
@@ -165,10 +166,12 @@ class OGCSimulation:
 
     def _initial_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         n = config.NUM_PARTICLES
-        ox, oy, oz = self.yarn_origin
+        d = self.yarn_end - self.yarn_origin
+        length = float(np.linalg.norm(d))
+        d_hat = (d / length) if length > 1e-6 else np.array([1.0, 0.0, 0.0], dtype=np.float32)
         pos_np = np.zeros((n, 3), dtype=np.float32)
         for i in range(n):
-            pos_np[i] = [ox + i * config.REST_LEN, oy, oz]
+            pos_np[i] = self.yarn_origin + d_hat * (i * config.REST_LEN)
         return pos_np, np.zeros((n, 3), dtype=np.float32)
 
     def _predict(self, wind: wp.vec3, sub_dt: float):

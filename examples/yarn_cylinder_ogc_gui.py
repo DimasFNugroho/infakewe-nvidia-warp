@@ -54,6 +54,9 @@ DEFAULTS = {
     "yarn_x":            0.0,
     "yarn_y":            0.0,
     "yarn_z":            0.0,
+    "yarn_end_x":        2.0,
+    "yarn_end_y":        0.0,
+    "yarn_end_z":        0.0,
 }
 
 
@@ -218,6 +221,13 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                         )
                         sim.reset()
                         frame[0] = 0
+                    elif key in ("yarn_end_x", "yarn_end_y", "yarn_end_z"):
+                        sim.yarn_end = np.array(
+                            [state["yarn_end_x"], state["yarn_end_y"], state["yarn_end_z"]],
+                            dtype=np.float32,
+                        )
+                        sim.reset()
+                        frame[0] = 0
                     apply_state()
         except py_queue.Empty:
             pass
@@ -256,7 +266,7 @@ def run_ui(cmd_queue):
 
     root = tk.Tk()
     root.title("OGC yarn–cylinder — controls")
-    root.geometry("460x870")
+    root.geometry("460x980")
 
     def add_slider(label, key, from_, to_, default, is_int=False, fmt="{:.3f}"):
         frm = ttk.Frame(root)
@@ -312,9 +322,14 @@ def run_ui(cmd_queue):
     add_slider("Cylinder Z",         "cyl_z",         -3.0,   3.0,  DEFAULTS["cyl_z"],  fmt="{:+.3f}")
 
     ttk.Label(root, text="Yarn origin", font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 0))
-    add_slider("Origin X",           "yarn_x",        -3.0,   3.0,  DEFAULTS["yarn_x"], fmt="{:+.3f}")
-    add_slider("Origin Y",           "yarn_y",        -3.0,   3.0,  DEFAULTS["yarn_y"], fmt="{:+.3f}")
-    add_slider("Origin Z",           "yarn_z",        -3.0,   3.0,  DEFAULTS["yarn_z"], fmt="{:+.3f}")
+    add_slider("Origin X",           "yarn_x",        -3.0,   3.0,  DEFAULTS["yarn_x"],     fmt="{:+.3f}")
+    add_slider("Origin Y",           "yarn_y",        -3.0,   3.0,  DEFAULTS["yarn_y"],     fmt="{:+.3f}")
+    add_slider("Origin Z",           "yarn_z",        -3.0,   3.0,  DEFAULTS["yarn_z"],     fmt="{:+.3f}")
+
+    ttk.Label(root, text="Yarn free end", font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 0))
+    add_slider("Free end X",         "yarn_end_x",    -3.0,   3.0,  DEFAULTS["yarn_end_x"], fmt="{:+.3f}")
+    add_slider("Free end Y",         "yarn_end_y",    -3.0,   3.0,  DEFAULTS["yarn_end_y"], fmt="{:+.3f}")
+    add_slider("Free end Z",         "yarn_end_z",    -3.0,   3.0,  DEFAULTS["yarn_end_z"], fmt="{:+.3f}")
 
     # ── Buttons ──────────────────────────────────────────────────────────────
     def send(cmd: str):
