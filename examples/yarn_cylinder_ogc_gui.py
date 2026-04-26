@@ -159,6 +159,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             while True:
                 cmd = cmd_queue.get_nowait()
                 kind = cmd[0]
+                print(f"[sim_worker] cmd: {cmd}", flush=True)
                 if   kind == "start": running[0] = True
                 elif kind == "pause": running[0] = False
                 elif kind == "reset":
@@ -193,8 +194,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         )
         canvas.update()
 
-    app.Timer(interval=1.0 / 60.0, connect=on_timer, start=True)
+    # IMPORTANT: keep a reference to the Timer.  vispy's Timer is not
+    # otherwise held by the backend in some configurations, so without this
+    # local binding it can be garbage-collected and stop firing — which makes
+    # the GUI look frozen and ignore Start clicks.
+    timer = app.Timer(interval=1.0 / 60.0, connect=on_timer, start=True)
+    print("[sim_worker] entering vispy event loop", flush=True)
     app.run()
+    del timer
 
 
 # ── Tkinter control panel (parent process) ───────────────────────────────────
@@ -250,6 +257,7 @@ def run_ui(cmd_queue):
 
     # ── Buttons ──────────────────────────────────────────────────────────────
     def send(cmd: str):
+        print(f"[ui] send: {cmd}", flush=True)
         cmd_queue.put((cmd,))
 
     btn_frm = ttk.Frame(root)
@@ -260,7 +268,7 @@ def run_ui(cmd_queue):
                ).pack(side="left", expand=True, fill="x", padx=2)
     ttk.Button(btn_frm, text="Reset", command=lambda: send("reset")
                ).pack(side="left", expand=True, fill="x", padx=2)
-    ttk.Button(btn_frm, text="Stop",
+    ttk.Button(btn_frm, text="Exit",
                command=lambda: (send("stop"), root.after(150, root.destroy))
                ).pack(side="left", expand=True, fill="x", padx=2)
 

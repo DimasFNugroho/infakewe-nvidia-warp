@@ -133,7 +133,7 @@ The `yarn_cylinder_ogc_gui.py` variant spawns the simulation + vispy
 viewer in a child process and drives it from a Tkinter control panel in
 the parent: sliders for gravity, damping, stretch/bend stiffness,
 substeps, OGC radius, contact stiffness, and cylinder radius, plus
-Start / Pause / Reset / Stop buttons. On Linux you may need
+Start / Pause / Reset / Exit buttons. On Linux you may need
 `sudo apt install -y python3-tk` for tkinter.
 
 ### Vispy controls
