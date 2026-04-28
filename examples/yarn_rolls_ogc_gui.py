@@ -77,17 +77,6 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     import warp as wp
     from vispy import app, scene
 
-    @wp.kernel
-    def _kernel_set_endpoints(
-        pos:    wp.array(dtype=wp.vec3),
-        p0:     wp.vec3,
-        pN:     wp.vec3,
-        n_last: int,
-    ):
-        """Set particle 0 and particle n_last in one single-thread GPU kernel.
-        Avoids the full pos_wp.numpy() round-trip that stalls the GPU pipeline."""
-        pos[0]      = p0
-        pos[n_last] = pN
     from vispy.scene import visuals
 
     import config
@@ -101,7 +90,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     from ogc.algorithm2 import EEContacts, detect_edge_edge
     from ogc.algorithm4 import (project_vf, project_ee,
                                  apply_vf_friction, apply_ee_friction,
-                                 damp_normal_velocity, clamp_velocity)
+                                 damp_normal_velocity, clamp_velocity,
+                                 set_endpoints)
     from kernels import (kernel_integrate,
                          kernel_stretch_even, kernel_stretch_odd,
                          kernel_bend, kernel_update_velocity)
@@ -322,8 +312,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             pN_wp = wp.vec3(float(pN[0]), float(pN[1]), float(pN[2]))
 
             # ── Set kinematic endpoints on GPU — no CPU round-trip ────────────
-            wp.launch(_kernel_set_endpoints, dim=1, device=device,
-                      inputs=[pos_wp, p0_wp, pN_wp, N - 1])
+            set_endpoints(pos_wp, p0_wp, pN_wp, N - 1, device)
 
             # ── Predict ───────────────────────────────────────────────────────
             wp.launch(kernel_integrate, dim=N, device=device,

@@ -414,3 +414,27 @@ def project_ee(
                     ee.active, ee.cp_yarn, ee.cp_obs, ee.dist, ee.normal, ee.s,
                     r, stiffness],
         )
+
+
+# ── Kernel: set two kinematic endpoint particles ──────────────────────────────
+
+@wp.kernel
+def kernel_set_endpoints(
+    pos:    wp.array(dtype=wp.vec3),
+    p0:     wp.vec3,
+    pN:     wp.vec3,
+    n_last: int,
+):
+    pos[0]      = p0
+    pos[n_last] = pN
+
+
+def set_endpoints(
+    pos:    wp.array,
+    p0:     wp.vec3,
+    pN:     wp.vec3,
+    n_last: int,
+    device: str,
+):
+    wp.launch(kernel_set_endpoints, dim=1, device=device,
+              inputs=[pos, p0, pN, n_last])
