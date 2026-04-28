@@ -79,6 +79,11 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     from vispy.scene import visuals
 
     import config
+    # ── Override yarn geometry for the roll-to-roll scenario ─────────────────
+    config.NUM_PARTICLES = 300
+    config.YARN_LENGTH   = 12.0
+    config.REST_LEN      = config.YARN_LENGTH / (config.NUM_PARTICLES - 1)
+
     from ogc.mesh       import build_cylinder, mesh_for_render
     from ogc.algorithm1 import ObstacleGPU, VFContacts, detect_vertex_facet
     from ogc.algorithm2 import EEContacts, detect_edge_edge
@@ -125,9 +130,11 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     # ── Geometry helpers ──────────────────────────────────────────────────────
 
     def _n_wrap() -> int:
-        """Number of particles wound around roll A (≈ one full circumference)."""
-        ra = max(float(state["roll_a_radius"]), 1e-6)
-        return max(2, min(int(round(2.0 * np.pi * ra / config.REST_LEN)), N // 2))
+        """Particles wound around roll A — 10 full wraps for ~20 s of yarn supply."""
+        ra       = max(float(state["roll_a_radius"]), 1e-6)
+        per_wrap = max(3, int(round(2.0 * np.pi * ra / config.REST_LEN)))
+        target   = 10 * per_wrap       # 10 full wraps
+        return min(target, N * 4 // 5) # leave ≥20% of particles for free span
 
     def init_angle_a() -> float:
         """Initial angle of particle 0 on roll A so the departure faces roll B."""
@@ -152,18 +159,22 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         return float(np.arctan2(ay - by, ax - bx))
 
     def make_initial_positions() -> np.ndarray:
-        """Yarn wound one full loop around roll A then straight to roll B."""
+        """Yarn wound helically around roll A (10 wraps), then free span to roll B."""
         ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
         ra         = max(float(state["roll_a_radius"]), 1e-6)
         dtheta     = config.REST_LEN / ra
         n_wrap     = _n_wrap()
+        per_wrap   = max(3, int(round(2.0 * np.pi * ra / config.REST_LEN)))
 
         positions: list = []
-        # Wound section — particle 0 is the innermost (most wound) point
+        # Wound section — particle 0 is the innermost (most wound) point.
+        # Each complete wrap shifts +Z by one REST_LEN (bobbin / helix layout).
         for i in range(n_wrap):
-            theta = angle_a[0] + i * dtheta
+            theta    = angle_a[0] + i * dtheta
+            z_offset = (i // per_wrap) * config.REST_LEN
             positions.append([ax + ra * np.cos(theta),
-                               ay + ra * np.sin(theta), az])
+                               ay + ra * np.sin(theta),
+                               az + z_offset])
 
         # Free span — from departure point linearly to roll B
         p_dep  = np.array(positions[-1], dtype=np.float32)
@@ -269,33 +280,40 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         v_max     = float(state["v_max"])
         zero_wind = wp.vec3(0.0, 0.0, 0.0)
 
-        ax, ay, az  = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
-        ra          = max(float(state["roll_a_radius"]), 1e-6)
-        M_a         = max(float(state["roll_a_mass"]), 1e-3)
-        I_a         = 0.5 * M_a * ra * ra           # solid-cylinder inertia
-        particle_m  = max(float(state["particle_mass"]), 1e-6)
+        ax, ay, az   = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
+        ra           = max(float(state["roll_a_radius"]), 1e-6)
+        M_a          = max(float(state["roll_a_mass"]), 1e-3)
+        n_wrap_val   = _n_wrap()
+        dtheta_a     = config.REST_LEN / ra
+        # Index of the first free particle beyond the wound section.
+        # Its tangential velocity is the payout signal: zero pull → zero velocity
+        # → omega_a stays at zero.  Roll A only spins when yarn is actually moving.
+        free_idx     = min(n_wrap_val, N - 2)
+        # Inertia time constant: heavier roll reacts more slowly to payout signal.
+        tau_a        = M_a * 0.3   # seconds (0.3 s per kg)
 
         for _ in range(config.SUBSTEPS):
-            # ── Roll A dynamics (torque from yarn tension in segment 0→1) ─────
+            # ── Roll A dynamics: velocity follower ───────────────────────────
             pos_np = pos_wp.numpy()
+            vel_np = vel_wp.numpy()
 
-            p0    = pos_np[0].astype(np.float64)
-            p1    = pos_np[1].astype(np.float64)
-            vec01 = p1 - p0
-            len01 = float(np.linalg.norm(vec01))
-            if len01 > 1e-6:
-                stretch     = max(0.0, len01 - float(config.REST_LEN))
-                # PBD-implied tension: F ≈ m * stretch / dt²
-                tension_mag = (particle_m / (sub_dt * sub_dt)) * stretch * float(state["stretch_stiff"])
-                t_hat       = vec01 / len01
-                r_vec       = p0 - np.array([ax, ay, az], dtype=np.float64)
-                torque_z    = float(r_vec[0] * tension_mag * t_hat[1]
-                                    - r_vec[1] * tension_mag * t_hat[0])
-            else:
-                torque_z = 0.0
+            # Tangential direction at the Roll A departure point
+            dep_angle = angle_a[0] + (n_wrap_val - 1) * dtheta_a
+            tx = -np.sin(dep_angle)
+            ty =  np.cos(dep_angle)
 
-            omega_a[0] *= 0.98                              # light bearing damping
-            omega_a[0] += torque_z / I_a * sub_dt
+            # Project first-free-particle velocity onto departure tangent
+            v1       = vel_np[free_idx]
+            v_payout = float(v1[0] * tx + v1[1] * ty)
+            if abs(v_payout) < 5e-4:   # noise floor — gravity-sag jitter stays zero
+                v_payout = 0.0
+
+            # Target ω for Roll A matches the yarn payout rate
+            omega_target = v_payout / ra
+
+            # First-order lag toward target — Roll A mass sets response speed
+            alpha       = sub_dt / (sub_dt + tau_a)
+            omega_a[0]  = omega_a[0] * (1.0 - alpha) + omega_target * alpha
             omega_a[0]  = max(-200.0, min(200.0, omega_a[0]))
             angle_a[0] += omega_a[0] * sub_dt
 
