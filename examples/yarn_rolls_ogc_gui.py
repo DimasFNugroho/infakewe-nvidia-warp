@@ -76,11 +76,23 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     import numpy as np
     import warp as wp
     from vispy import app, scene
+
+    @wp.kernel
+    def _kernel_set_endpoints(
+        pos:    wp.array(dtype=wp.vec3),
+        p0:     wp.vec3,
+        pN:     wp.vec3,
+        n_last: int,
+    ):
+        """Set particle 0 and particle n_last in one single-thread GPU kernel.
+        Avoids the full pos_wp.numpy() round-trip that stalls the GPU pipeline."""
+        pos[0]      = p0
+        pos[n_last] = pN
     from vispy.scene import visuals
 
     import config
     # ── Override yarn geometry for the roll-to-roll scenario ─────────────────
-    config.NUM_PARTICLES = 300
+    config.NUM_PARTICLES = 150
     config.YARN_LENGTH   = 12.0
     config.REST_LEN      = config.YARN_LENGTH / (config.NUM_PARTICLES - 1)
 
@@ -280,55 +292,38 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         v_max     = float(state["v_max"])
         zero_wind = wp.vec3(0.0, 0.0, 0.0)
 
-        ax, ay, az   = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
-        ra           = max(float(state["roll_a_radius"]), 1e-6)
-        M_a          = max(float(state["roll_a_mass"]), 1e-3)
-        n_wrap_val   = _n_wrap()
-        dtheta_a     = config.REST_LEN / ra
-        # Index of the first free particle beyond the wound section.
-        # Its tangential velocity is the payout signal: zero pull → zero velocity
-        # → omega_a stays at zero.  Roll A only spins when yarn is actually moving.
-        free_idx     = min(n_wrap_val, N - 2)
-        # Inertia time constant: heavier roll reacts more slowly to payout signal.
-        tau_a        = M_a * 0.3   # seconds (0.3 s per kg)
+        ax, ay, az  = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
+        ra          = max(float(state["roll_a_radius"]), 1e-6)
+        M_a         = max(float(state["roll_a_mass"]), 1e-3)
+        # Inertia time constant: heavier roll spins up and coasts more slowly.
+        tau_a       = M_a * 0.3   # seconds per kg
 
         for _ in range(config.SUBSTEPS):
-            # ── Roll A dynamics: velocity follower ───────────────────────────
-            pos_np = pos_wp.numpy()
-            vel_np = vel_wp.numpy()
+            # ── Roll A: kinematic coupling from yarn conservation ─────────────
+            # The yarn is nearly inextensible (PBD stretch ≈ 0), so Roll A must
+            # pay out yarn at exactly the same surface speed as Roll B consumes
+            # it.  omega_target = pull_speed / ra follows from this constraint.
+            # A first-order lag (τ = roll_a_mass × 0.3 s/kg) gives the inertia
+            # effect: zero pull_speed → omega_target = 0 → omega_a → 0.
+            omega_target = float(state["pull_speed"]) / ra
+            alpha        = sub_dt / (sub_dt + tau_a)
+            omega_a[0]   = omega_a[0] * (1.0 - alpha) + omega_target * alpha
+            omega_a[0]   = max(-200.0, min(200.0, omega_a[0]))
+            angle_a[0]  += omega_a[0] * sub_dt
 
-            # Tangential direction at the Roll A departure point
-            dep_angle = angle_a[0] + (n_wrap_val - 1) * dtheta_a
-            tx = -np.sin(dep_angle)
-            ty =  np.cos(dep_angle)
-
-            # Project first-free-particle velocity onto departure tangent
-            v1       = vel_np[free_idx]
-            v_payout = float(v1[0] * tx + v1[1] * ty)
-            if abs(v_payout) < 5e-4:   # noise floor — gravity-sag jitter stays zero
-                v_payout = 0.0
-
-            # Target ω for Roll A matches the yarn payout rate
-            omega_target = v_payout / ra
-
-            # First-order lag toward target — Roll A mass sets response speed
-            alpha       = sub_dt / (sub_dt + tau_a)
-            omega_a[0]  = omega_a[0] * (1.0 - alpha) + omega_target * alpha
-            omega_a[0]  = max(-200.0, min(200.0, omega_a[0]))
-            angle_a[0] += omega_a[0] * sub_dt
-
-            p0_new = np.array([ax + ra * np.cos(angle_a[0]),
-                               ay + ra * np.sin(angle_a[0]), az], dtype=np.float32)
+            p0_wp = wp.vec3(ax + ra * float(np.cos(angle_a[0])),
+                            ay + ra * float(np.sin(angle_a[0])),
+                            az)
 
             # ── Roll B advance ────────────────────────────────────────────────
             rb = max(float(state["roll_b_radius"]), 1e-6)
             angle_b[0] += float(state["pull_speed"]) * sub_dt / rb
             pN = roll_b_attach(angle_b[0])
+            pN_wp = wp.vec3(float(pN[0]), float(pN[1]), float(pN[2]))
 
-            # ── Write kinematic endpoints (one GPU round-trip) ────────────────
-            pos_np[0]  = p0_new
-            pos_np[-1] = np.array(pN, dtype=np.float32)
-            pos_wp.assign(wp.array(pos_np, dtype=wp.vec3, device=device))
+            # ── Set kinematic endpoints on GPU — no CPU round-trip ────────────
+            wp.launch(_kernel_set_endpoints, dim=1, device=device,
+                      inputs=[pos_wp, p0_wp, pN_wp, N - 1])
 
             # ── Predict ───────────────────────────────────────────────────────
             wp.launch(kernel_integrate, dim=N, device=device,
