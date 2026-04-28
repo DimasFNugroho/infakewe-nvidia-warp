@@ -81,8 +81,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     import config
     # ── Override yarn geometry for the roll-to-roll scenario ─────────────────
-    config.NUM_PARTICLES = 150
-    config.YARN_LENGTH   = 12.0
+    config.NUM_PARTICLES = 50
+    config.YARN_LENGTH   = 3.0
     config.REST_LEN      = config.YARN_LENGTH / (config.NUM_PARTICLES - 1)
 
     from ogc.mesh       import build_cylinder, mesh_for_render
@@ -131,21 +131,11 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     # ── Geometry helpers ──────────────────────────────────────────────────────
 
-    def _n_wrap() -> int:
-        """Particles wound around roll A — 10 full wraps for ~20 s of yarn supply."""
-        ra       = max(float(state["roll_a_radius"]), 1e-6)
-        per_wrap = max(3, int(round(2.0 * np.pi * ra / config.REST_LEN)))
-        target   = 10 * per_wrap       # 10 full wraps
-        return min(target, N * 4 // 5) # leave ≥20% of particles for free span
-
     def init_angle_a() -> float:
-        """Initial angle of particle 0 on roll A so the departure faces roll B."""
+        """Initial Roll A angle: departure point faces Roll B."""
         ax, ay = state["roll_a_x"], state["roll_a_y"]
         bx, by = state["roll_b_x"], state["roll_b_y"]
-        depart = float(np.arctan2(by - ay, bx - ax))
-        ra     = max(float(state["roll_a_radius"]), 1e-6)
-        n      = _n_wrap()
-        return depart - (n - 1) * config.REST_LEN / ra
+        return float(np.arctan2(by - ay, bx - ax))
 
     def roll_b_attach(angle: float) -> np.ndarray:
         """Point on roll B surface at the given winding angle."""
@@ -161,32 +151,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         return float(np.arctan2(ay - by, ax - bx))
 
     def make_initial_positions() -> np.ndarray:
-        """Yarn wound helically around roll A (10 wraps), then free span to roll B."""
+        """Straight-line yarn from Roll A departure point to Roll B attachment."""
         ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
-        ra         = max(float(state["roll_a_radius"]), 1e-6)
-        dtheta     = config.REST_LEN / ra
-        n_wrap     = _n_wrap()
-        per_wrap   = max(3, int(round(2.0 * np.pi * ra / config.REST_LEN)))
-
-        positions: list = []
-        # Wound section — particle 0 is the innermost (most wound) point.
-        # Each complete wrap shifts +Z by one REST_LEN (bobbin / helix layout).
-        for i in range(n_wrap):
-            theta    = angle_a[0] + i * dtheta
-            z_offset = (i // per_wrap) * config.REST_LEN
-            positions.append([ax + ra * np.cos(theta),
-                               ay + ra * np.sin(theta),
-                               az + z_offset])
-
-        # Free span — from departure point linearly to roll B
-        p_dep  = np.array(positions[-1], dtype=np.float32)
-        p_end  = roll_b_attach(angle_b[0])
-        n_free = N - n_wrap
-        for i in range(1, n_free + 1):
-            t = i / n_free
-            positions.append(list(p_dep + t * (p_end - p_dep)))
-
-        return np.array(positions[:N], dtype=np.float32)
+        ra = max(float(state["roll_a_radius"]), 1e-6)
+        p0 = np.array([ax + ra * np.cos(angle_a[0]),
+                       ay + ra * np.sin(angle_a[0]), az], dtype=np.float32)
+        pN = roll_b_attach(angle_b[0])
+        return np.array([p0 + (pN - p0) * i / (N - 1) for i in range(N)],
+                        dtype=np.float32)
 
     def make_inv_mass() -> np.ndarray:
         m = max(float(state["particle_mass"]), 1e-6)
