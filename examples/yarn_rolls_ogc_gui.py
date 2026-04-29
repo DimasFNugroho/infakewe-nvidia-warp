@@ -297,7 +297,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     _change_time  = [0.0]    # perf_counter() when params last differed from graph
     _frame_ms     = [0.0]    # wall time of the last sim_step() call (shown in HUD)
     _USE_GRAPH    = (device == "cuda")
-    _DEBOUNCE     = 0.30     # seconds to wait for slider to settle before rebuild
+    _DEBOUNCE     = 0.10     # seconds to wait for slider to settle before rebuild
 
     def apply_state():
         config.GRAVITY         = wp.vec3(0.0, float(state["gravity_y"]), 0.0)
