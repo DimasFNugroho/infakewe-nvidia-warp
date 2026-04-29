@@ -1,11 +1,11 @@
 {
-  "heatmap_max_strain": 0.7706,
+  "heatmap_max_strain": 0.66996,
   "gravity_y": -9.81,
-  "particle_mass": 6.326293333333334,
-  "damping": 0.9971851851851852,
+  "particle_mass": 0.001,
+  "damping": 0.9994074074074074,
   "stretch_stiff": 0.30303030303030304,
   "bend_stiff": 0.0,
-  "substeps": 73.0,
+  "substeps": 150.0,
   "constraint_iter": 1.0,
   "ogc_r": 0.010045454545454545,
   "ogc_stiff": 1.0,
@@ -25,7 +25,7 @@
   "roll_b_radius": 0.15,
   "pull_speed": 0.7629629629629626,
   "cyl_x": 0.0,
-  "cyl_y": 0.6266666666666669,
+  "cyl_y": 0.18222222222222229,
   "cyl_z": 0.0,
   "cyl_radius": 0.08
 }

@@ -416,6 +416,305 @@ def project_ee(
         )
 
 
+# ── GPU-params kernel variants (for CUDA graph live-param updates) ───────────
+#
+# These mirror kernels.py and the contact kernels above, but every mutable
+# slider-controlled scalar is accepted as a wp.array(dtype=float) of size 1.
+# The CUDA graph records the array *pointer* at capture time; writing a new
+# value into the array before each wp.capture_launch() lets params change
+# without rebuilding the graph.  Only structural params (substeps,
+# constraint_iter) that change the graph node count still require a rebuild.
+
+@wp.kernel
+def kernel_integrate_gp(
+    pos:       wp.array(dtype=wp.vec3),
+    vel:       wp.array(dtype=wp.vec3),
+    prev_pos:  wp.array(dtype=wp.vec3),
+    inv_mass:  wp.array(dtype=float),
+    gravity_y: wp.array(dtype=float),
+    dt:        float,
+    damping:   wp.array(dtype=float),
+):
+    i = wp.tid()
+    if inv_mass[i] == float(0.0):
+        prev_pos[i] = pos[i]
+        return
+    prev_pos[i] = pos[i]
+    g       = wp.vec3(float(0.0), gravity_y[0], float(0.0))
+    vel[i]  = vel[i] * damping[0] + g * dt
+    pos[i]  = pos[i] + vel[i] * dt
+
+
+@wp.kernel
+def kernel_stretch_even_gp(
+    pos:      wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=float),
+    rest_len: float,
+    stiff:    wp.array(dtype=float),
+):
+    t = wp.tid()
+    a = t * 2; b = a + 1
+    if b >= pos.shape[0]:
+        return
+    pa = pos[a]; pb = pos[b]
+    d = pb - pa; dist = wp.length(d)
+    if dist < float(1.0e-8):
+        return
+    corr = d * ((dist - rest_len) / dist) * stiff[0]
+    wa = inv_mass[a]; wb = inv_mass[b]; wt = wa + wb
+    if wt < float(1.0e-8):
+        return
+    pos[a] = pa + corr * (wa / wt)
+    pos[b] = pb - corr * (wb / wt)
+
+
+@wp.kernel
+def kernel_stretch_odd_gp(
+    pos:      wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=float),
+    rest_len: float,
+    stiff:    wp.array(dtype=float),
+):
+    t = wp.tid()
+    a = t * 2 + 1; b = a + 1
+    if b >= pos.shape[0]:
+        return
+    pa = pos[a]; pb = pos[b]
+    d = pb - pa; dist = wp.length(d)
+    if dist < float(1.0e-8):
+        return
+    corr = d * ((dist - rest_len) / dist) * stiff[0]
+    wa = inv_mass[a]; wb = inv_mass[b]; wt = wa + wb
+    if wt < float(1.0e-8):
+        return
+    pos[a] = pa + corr * (wa / wt)
+    pos[b] = pb - corr * (wb / wt)
+
+
+@wp.kernel
+def kernel_bend_gp(
+    pos:      wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=float),
+    rest_len: float,
+    stiff:    wp.array(dtype=float),
+):
+    i = wp.tid(); j = i + 2
+    if j >= pos.shape[0]:
+        return
+    pa = pos[i]; pb = pos[j]
+    d = pb - pa; dist = wp.length(d)
+    if dist < float(1.0e-8):
+        return
+    corr = d * ((dist - rest_len * float(2.0)) / dist) * stiff[0]
+    wa = inv_mass[i]; wb = inv_mass[j]; wt = wa + wb
+    if wt < float(1.0e-8):
+        return
+    pos[i] = pa + corr * (wa / wt)
+    pos[j] = pb - corr * (wb / wt)
+
+
+@wp.kernel
+def kernel_vf_project_gp(
+    pos:       wp.array(dtype=wp.vec3),
+    inv_mass:  wp.array(dtype=float),
+    vf_active: wp.array(dtype=int),
+    vf_cp:     wp.array(dtype=wp.vec3),
+    vf_dist:   wp.array(dtype=float),
+    vf_normal: wp.array(dtype=wp.vec3),
+    r:         wp.array(dtype=float),
+    stiffness: wp.array(dtype=float),
+):
+    i = wp.tid()
+    if inv_mass[i] == float(0.0) or vf_active[i] == 0 or vf_dist[i] >= r[0]:
+        return
+    target = vf_cp[i] + vf_normal[i] * r[0]
+    pos[i]  = pos[i] + (target - pos[i]) * stiffness[0]
+
+
+@wp.kernel
+def kernel_ee_project_gp(
+    pos:        wp.array(dtype=wp.vec3),
+    inv_mass:   wp.array(dtype=float),
+    yarn_edges: wp.array(dtype=wp.vec2i),
+    parity:     int,
+    ee_active:  wp.array(dtype=int),
+    ee_cp_yarn: wp.array(dtype=wp.vec3),
+    ee_cp_obs:  wp.array(dtype=wp.vec3),
+    ee_dist:    wp.array(dtype=float),
+    ee_normal:  wp.array(dtype=wp.vec3),
+    ee_s:       wp.array(dtype=float),
+    r:          wp.array(dtype=float),
+    stiffness:  wp.array(dtype=float),
+):
+    i = wp.tid()
+    if (i & 1) != parity or ee_active[i] == 0 or ee_dist[i] >= r[0]:
+        return
+    ev = yarn_edges[i]
+    wa = inv_mass[ev[0]]; wb = inv_mass[ev[1]]; wt = wa + wb
+    if wt < float(1.0e-12):
+        return
+    target_cp = ee_cp_obs[i] + ee_normal[i] * r[0]
+    delta     = (target_cp - ee_cp_yarn[i]) * stiffness[0]
+    s = ee_s[i]; ca = float(1.0) - s; cb = s
+    w_denom = ca * ca * wa + cb * cb * wb
+    if w_denom < float(1.0e-12):
+        return
+    pos[ev[0]] = pos[ev[0]] + delta * (ca * wa / w_denom)
+    pos[ev[1]] = pos[ev[1]] + delta * (cb * wb / w_denom)
+
+
+@wp.kernel
+def kernel_vf_friction_gp(
+    pos:       wp.array(dtype=wp.vec3),
+    prev_pos:  wp.array(dtype=wp.vec3),
+    inv_mass:  wp.array(dtype=float),
+    vf_active: wp.array(dtype=int),
+    vf_dist:   wp.array(dtype=float),
+    vf_normal: wp.array(dtype=wp.vec3),
+    r:         wp.array(dtype=float),
+    mu_s:      wp.array(dtype=float),
+    mu_k:      wp.array(dtype=float),
+):
+    i = wp.tid()
+    if inv_mass[i] == float(0.0) or vf_active[i] == 0 or vf_dist[i] >= r[0]:
+        return
+    penetration  = r[0] - vf_dist[i]
+    correction_n = wp.max(penetration, r[0] * float(0.5))
+    n       = vf_normal[i]
+    delta   = pos[i] - prev_pos[i]
+    delta_t = delta - n * wp.dot(delta, n)
+    len_t   = wp.length(delta_t)
+    if len_t < float(1.0e-6):
+        return
+    if len_t <= mu_s[0] * correction_n:
+        pos[i] = pos[i] - delta_t
+    else:
+        scale  = wp.min(mu_k[0] * correction_n / len_t, float(1.0))
+        pos[i] = pos[i] - delta_t * scale
+
+
+@wp.kernel
+def kernel_ee_friction_gp(
+    pos:        wp.array(dtype=wp.vec3),
+    prev_pos:   wp.array(dtype=wp.vec3),
+    inv_mass:   wp.array(dtype=float),
+    yarn_edges: wp.array(dtype=wp.vec2i),
+    parity:     int,
+    ee_active:  wp.array(dtype=int),
+    ee_dist:    wp.array(dtype=float),
+    ee_normal:  wp.array(dtype=wp.vec3),
+    ee_s:       wp.array(dtype=float),
+    r:          wp.array(dtype=float),
+    mu_s:       wp.array(dtype=float),
+    mu_k:       wp.array(dtype=float),
+):
+    i = wp.tid()
+    if (i & 1) != parity or ee_active[i] == 0 or ee_dist[i] >= r[0]:
+        return
+    penetration  = r[0] - ee_dist[i]
+    correction_n = wp.max(penetration, r[0] * float(0.5))
+    ev = yarn_edges[i]
+    wa = inv_mass[ev[0]]; wb = inv_mass[ev[1]]; wt = wa + wb
+    if wt < float(1.0e-12):
+        return
+    s = ee_s[i]; ca = float(1.0) - s; cb = s
+    cp_now  = pos[ev[0]] * ca + pos[ev[1]] * cb
+    cp_prev = prev_pos[ev[0]] * ca + prev_pos[ev[1]] * cb
+    delta   = cp_now - cp_prev
+    n       = ee_normal[i]
+    delta_t = delta - n * wp.dot(delta, n)
+    len_t   = wp.length(delta_t)
+    if len_t < float(1.0e-6):
+        return
+    if len_t <= mu_s[0] * correction_n:
+        scale = float(1.0)
+    else:
+        scale = wp.min(mu_k[0] * correction_n / len_t, float(1.0))
+    correction = -delta_t * scale
+    w_denom = ca * ca * wa + cb * cb * wb
+    if w_denom < float(1.0e-12):
+        return
+    pos[ev[0]] = pos[ev[0]] + correction * (ca * wa / w_denom)
+    pos[ev[1]] = pos[ev[1]] + correction * (cb * wb / w_denom)
+
+
+@wp.kernel
+def kernel_vf_damp_normal_velocity_gp(
+    vel:       wp.array(dtype=wp.vec3),
+    inv_mass:  wp.array(dtype=float),
+    vf_active: wp.array(dtype=int),
+    vf_dist:   wp.array(dtype=float),
+    vf_normal: wp.array(dtype=wp.vec3),
+    r:         wp.array(dtype=float),
+):
+    i = wp.tid()
+    if inv_mass[i] == float(0.0) or vf_active[i] == 0:
+        return
+    skin = r[0] * float(0.5)
+    if vf_dist[i] > r[0] + skin:
+        return
+    n        = vf_normal[i]
+    v_inward = wp.dot(vel[i], n)
+    if v_inward < float(0.0):
+        vel[i] = vel[i] - n * v_inward
+
+
+@wp.kernel
+def kernel_clamp_velocity_gp(
+    vel:   wp.array(dtype=wp.vec3),
+    v_max: wp.array(dtype=float),
+):
+    i = wp.tid()
+    if v_max[0] <= float(0.0):
+        return
+    v_mag = wp.length(vel[i])
+    if v_mag > v_max[0]:
+        vel[i] = vel[i] * (v_max[0] / v_mag)
+
+
+# ── Python wrappers for GP contact kernels ────────────────────────────────────
+
+def project_vf_gp(pos, inv_mass, vf, gp_r, gp_stiff, device):
+    wp.launch(kernel_vf_project_gp, dim=pos.shape[0], device=device,
+              inputs=[pos, inv_mass, vf.active, vf.cp, vf.dist, vf.normal,
+                      gp_r, gp_stiff])
+
+
+def project_ee_gp(pos, inv_mass, yarn_edges, ee, gp_r, gp_stiff, device):
+    n = yarn_edges.shape[0]
+    for parity in (0, 1):
+        wp.launch(kernel_ee_project_gp, dim=n, device=device,
+                  inputs=[pos, inv_mass, yarn_edges, parity,
+                          ee.active, ee.cp_yarn, ee.cp_obs,
+                          ee.dist, ee.normal, ee.s, gp_r, gp_stiff])
+
+
+def apply_vf_friction_gp(pos, prev_pos, inv_mass, vf, gp_r, gp_mu_s, gp_mu_k, device):
+    wp.launch(kernel_vf_friction_gp, dim=pos.shape[0], device=device,
+              inputs=[pos, prev_pos, inv_mass,
+                      vf.active, vf.dist, vf.normal, gp_r, gp_mu_s, gp_mu_k])
+
+
+def apply_ee_friction_gp(pos, prev_pos, inv_mass, yarn_edges, ee,
+                          gp_r, gp_mu_s, gp_mu_k, device):
+    n = yarn_edges.shape[0]
+    for parity in (0, 1):
+        wp.launch(kernel_ee_friction_gp, dim=n, device=device,
+                  inputs=[pos, prev_pos, inv_mass, yarn_edges, parity,
+                          ee.active, ee.dist, ee.normal, ee.s,
+                          gp_r, gp_mu_s, gp_mu_k])
+
+
+def damp_normal_velocity_gp(vel, inv_mass, vf, gp_r, device):
+    wp.launch(kernel_vf_damp_normal_velocity_gp, dim=vel.shape[0], device=device,
+              inputs=[vel, inv_mass, vf.active, vf.dist, vf.normal, gp_r])
+
+
+def clamp_velocity_gp(vel, gp_v_max, device):
+    wp.launch(kernel_clamp_velocity_gp, dim=vel.shape[0], device=device,
+              inputs=[vel, gp_v_max])
+
+
 # ── Kernel: passive roll rotation driven by yarn tension ─────────────────────
 
 @wp.kernel
