@@ -524,6 +524,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         parent=canvas.scene, pos=(10, 60),
     )
 
+    # Warning banner shown while graph is rebuilding (params changed from UI).
+    # Centered horizontally, near the top of the canvas.
+    _warn = visuals.Text(
+        text="", color=(1.0, 0.75, 0.0, 1.0), font_size=11,
+        anchor_x="center", anchor_y="top",
+        parent=canvas.scene, pos=(480, 40),
+    )
+
     # ── Obstacle rebuild helpers ───────────────────────────────────────────────
 
     def rebuild_roll_a():
@@ -598,6 +606,10 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         status     = "RUN" if running[0] else "PAUSED"
         graph_mode = "graph" if (_USE_GRAPH and _graph[0] is not None
                                  and _snapshot_params() == _graph_params[0]) else "loop"
+        _warn.text = (
+            "-- Parameter changed from UI: simulation running slower until graph rebuilds --"
+            if graph_mode == "loop" else ""
+        )
         hud.text = (
             f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
             f"iter={config.CONSTRAINT_ITER}\n"
