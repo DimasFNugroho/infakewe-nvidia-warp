@@ -517,9 +517,11 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     marker_a.set_data(p[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
     marker_b.set_data(p[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
+    # pos=(10, 60): text renders upward from this anchor in vispy canvas coords,
+    # so 3 lines of font_size=10 need ~15px each → land at y≈60, 45, 30 (all visible).
     hud = visuals.Text(
         text="", color="white", font_size=10, anchor_x="left", anchor_y="top",
-        parent=canvas.scene, pos=(10, 20),
+        parent=canvas.scene, pos=(10, 60),
     )
 
     # ── Obstacle rebuild helpers ───────────────────────────────────────────────
@@ -597,12 +599,12 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         graph_mode = "graph" if (_USE_GRAPH and _graph[0] is not None
                                  and _snapshot_params() == _graph_params[0]) else "loop"
         hud.text = (
-            f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
-            f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
+            f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
+            f"iter={config.CONSTRAINT_ITER}\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
             f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°\n"
-            f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
-            f"iter={config.CONSTRAINT_ITER}"
+            f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
+            f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms"
         )
         canvas.update()
 
