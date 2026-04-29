@@ -78,6 +78,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     sys.path.insert(0, script_dir)
 
     import queue as py_queue
+    import time
     import numpy as np
     import warp as wp
     from vispy import app, scene
@@ -285,6 +286,19 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         [obs_mid, vf_mid, ee_mid],
     ]
 
+    # ── CUDA graph capture state ──────────────────────────────────────────────
+    # Replaying a captured graph eliminates Python kernel-launch overhead
+    # (~16 000 launches/frame at current settings → ~80 ms saved/frame).
+    # The graph is rebuilt whenever slider-controlled params change, with a
+    # 300 ms debounce so continuous slider drag stays smooth.
+    _graph        = [None]   # captured wp.Graph, or None if stale / first run
+    _graph_params = [{}]     # scalar-param snapshot baked into _graph
+    _last_snap    = [{}]     # snapshot from the previous frame
+    _change_time  = [0.0]    # perf_counter() when params last differed from graph
+    _frame_ms     = [0.0]    # wall time of the last sim_step() call (shown in HUD)
+    _USE_GRAPH    = (device == "cuda")
+    _DEBOUNCE     = 0.30     # seconds to wait for slider to settle before rebuild
+
     def apply_state():
         config.GRAVITY         = wp.vec3(0.0, float(state["gravity_y"]), 0.0)
         config.DAMPING         = float(state["damping"])
@@ -310,7 +324,47 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         sim_time[0] = 0.0
         frame[0]    = 0
 
-    def sim_step():
+    # ── Shared substep body ───────────────────────────────────────────────────
+    # Called both during CUDA graph capture (records launches without executing)
+    # and in the Python-fallback path (executes launches immediately).
+
+    def _snapshot_params() -> dict:
+        """All scalar params that are baked into the CUDA graph at capture time."""
+        return {
+            "substeps":               config.SUBSTEPS,
+            "constraint_iter":        config.CONSTRAINT_ITER,
+            "gravity_y":              float(state["gravity_y"]),
+            "damping":                float(state["damping"]),
+            "stretch_stiff":          float(state["stretch_stiff"]),
+            "bend_stiff":             float(state["bend_stiff"]),
+            "ogc_r":                  float(state["ogc_r"]),
+            "ogc_stiff":              float(state["ogc_stiff"]),
+            "mu_static":              float(state["mu_static"]),
+            "mu_kinetic":             float(state["mu_kinetic"]),
+            "v_max":                  float(state["v_max"]),
+            "pull_speed":             float(state["pull_speed"]),
+            "particle_mass":          float(state["particle_mass"]),
+            "roll_a_x":               float(state["roll_a_x"]),
+            "roll_a_y":               float(state["roll_a_y"]),
+            "roll_a_z":               float(state["roll_a_z"]),
+            "roll_a_radius":          float(state["roll_a_radius"]),
+            "roll_a_mass":            float(state["roll_a_mass"]),
+            "roll_a_bearing_damping": float(state["roll_a_bearing_damping"]),
+            "roll_a_torque_scale":    float(state["roll_a_torque_scale"]),
+            "roll_b_x":               float(state["roll_b_x"]),
+            "roll_b_y":               float(state["roll_b_y"]),
+            "roll_b_z":               float(state["roll_b_z"]),
+            "roll_b_radius":          float(state["roll_b_radius"]),
+        }
+
+    def _execute_substeps():
+        """One full frame of substeps — graph-capture-safe.
+
+        Every Python expression here is evaluated at the time this function
+        is called.  In graph-capture mode that means the values are baked
+        into the recorded graph nodes.  In Python-fallback mode they execute
+        immediately with the current state values.
+        """
         sub_dt    = config.DT / config.SUBSTEPS
         inv_sdt   = 1.0 / sub_dt
         r         = float(state["ogc_r"])
@@ -320,50 +374,37 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         v_max     = float(state["v_max"])
         zero_wind = wp.vec3(0.0, 0.0, 0.0)
 
-        ax, ay, az  = float(state["roll_a_x"]), float(state["roll_a_y"]), float(state["roll_a_z"])
-        ra          = max(float(state["roll_a_radius"]), 1e-6)
-        M_a         = max(float(state["roll_a_mass"]), 1e-3)
-        center_a    = wp.vec3(ax, ay, az)
+        ax, ay, az = float(state["roll_a_x"]), float(state["roll_a_y"]), float(state["roll_a_z"])
+        ra         = max(float(state["roll_a_radius"]), 1e-6)
+        M_a        = max(float(state["roll_a_mass"]), 1e-3)
+        center_a   = wp.vec3(ax, ay, az)
 
-        bx, by, bz  = float(state["roll_b_x"]), float(state["roll_b_y"]), float(state["roll_b_z"])
-        rb          = max(float(state["roll_b_radius"]), 1e-6)
-        center_b    = wp.vec3(bx, by, bz)
-        # Particles sit at roll_radius + ogc_r so they rest on the OGC offset
-        # surface and the contact kernel never fires at the yarn tips.
-        orbit_r_a   = ra + r
-        orbit_r_b   = rb + r
+        bx, by, bz = float(state["roll_b_x"]), float(state["roll_b_y"]), float(state["roll_b_z"])
+        rb         = max(float(state["roll_b_radius"]), 1e-6)
+        center_b   = wp.vec3(bx, by, bz)
+        orbit_r_a  = ra + r
+        orbit_r_b  = rb + r
 
         for _ in range(config.SUBSTEPS):
-            # ── Roll A: passive rotation from yarn tension (revolute joint) ───
             roll_a_torque_step(
                 pos_wp, center_a, ra, orbit_r_a,
                 config.REST_LEN, config.STRETCH_STIFF,
-                float(state["particle_mass"]), M_a,
-                sub_dt,
+                float(state["particle_mass"]), M_a, sub_dt,
                 float(state["roll_a_bearing_damping"]),
                 float(state["roll_a_torque_scale"]),
-                200.0,
-                angle_a_wp, omega_a_wp, device,
+                200.0, angle_a_wp, omega_a_wp, device,
             )
-
-            # ── Roll B: motor-driven at pull_speed, sets pos[N-1] on GPU ─────
             roll_b_motor_step(
                 pos_wp, center_b, rb, orbit_r_b,
                 float(state["pull_speed"]), sub_dt,
                 N - 1, angle_b_wp, device,
             )
-
-            # ── Predict ───────────────────────────────────────────────────────
             wp.launch(kernel_integrate, dim=N, device=device,
                       inputs=[pos_wp, vel_wp, prev_pos_wp, inv_mass_wp,
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
-
-            # ── Contact detection ─────────────────────────────────────────────
             for obs, vf, ee in contacts:
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
-
-            # ── Inner PBD iterations ──────────────────────────────────────────
             for _k in range(config.CONSTRAINT_ITER):
                 wp.launch(kernel_stretch_even, dim=n_even, device=device,
                           inputs=[pos_wp, inv_mass_wp, config.REST_LEN, config.STRETCH_STIFF])
@@ -374,22 +415,71 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                 for obs, vf, ee in contacts:
                     project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
                     project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
-
-            # ── Friction ──────────────────────────────────────────────────────
             for obs, vf, ee in contacts:
                 apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   vf, r, mu_s, mu_k, device)
                 apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   yarn_edges_wp, ee, r, mu_s, mu_k, device)
-
-            # ── Velocity update ───────────────────────────────────────────────
             wp.launch(kernel_update_velocity, dim=N, device=device,
                       inputs=[pos_wp, prev_pos_wp, vel_wp, inv_mass_wp, inv_sdt])
             for obs, vf, ee in contacts:
                 damp_normal_velocity(vel_wp, inv_mass_wp, vf, r, device)
             clamp_velocity(vel_wp, v_max, device)
 
-        sim_time[0] += config.DT
+    def _rebuild_graph():
+        """(Re)capture the substep loop as a CUDA graph.
+
+        Must be called AFTER apply_state() so that config.* values are current.
+        The capture does a dry-run (one non-executing pass) then stores the
+        resulting graph for repeated replay.
+        """
+        apply_state()
+        wp.capture_begin(device=device)
+        _execute_substeps()
+        _graph[0]        = wp.capture_end(device=device)
+        _graph_params[0] = _snapshot_params()
+        print(
+            f"[sim] CUDA graph built: {config.SUBSTEPS} substeps × "
+            f"{config.CONSTRAINT_ITER} iter",
+            flush=True,
+        )
+
+    def sim_step():
+        t0 = time.perf_counter()
+
+        if _USE_GRAPH:
+            snap = _snapshot_params()
+
+            # Reset debounce timer whenever params differ from last frame.
+            if snap != _last_snap[0]:
+                _change_time[0] = t0
+            _last_snap[0] = snap
+
+            if _graph[0] is None or snap != _graph_params[0]:
+                # Graph is stale or absent.
+                # Rebuild immediately on first call; otherwise debounce so that
+                # rapid slider drag keeps running (Python-loop fallback) without
+                # triggering a rebuild on every frame.
+                if _graph[0] is None or (t0 - _change_time[0]) >= _DEBOUNCE:
+                    _rebuild_graph()
+                    # fall through to capture_launch below
+                else:
+                    # Still within debounce window → run Python loop, correct params
+                    apply_state()
+                    _execute_substeps()
+                    sim_time[0]   += config.DT
+                    _frame_ms[0]   = (time.perf_counter() - t0) * 1000.0
+                    return
+
+            wp.capture_launch(_graph[0])
+
+        else:
+            # CPU fallback (no CUDA available) — always Python loop
+            apply_state()
+            _execute_substeps()
+
+        sim_time[0]  += config.DT
+        _frame_ms[0]  = (time.perf_counter() - t0) * 1000.0
 
     # ── Warm up Warp kernels ──────────────────────────────────────────────────
     print(f"[sim_worker] device={device} — warming up kernels...", flush=True)
@@ -439,6 +529,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         contacts[0][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         roll_a_vis.set_data(vertices=vv, faces=ff, color=ROLL_A_COL)
+        _graph[0] = None   # obstacle GPU arrays changed — graph pointers stale
         sim_reset()
 
     def rebuild_roll_b():
@@ -446,6 +537,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         contacts[1][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         roll_b_vis.set_data(vertices=vv, faces=ff, color=ROLL_B_COL)
+        _graph[0] = None
         sim_reset()
 
     def rebuild_guide():
@@ -453,6 +545,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         contacts[2][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         cyl_vis.set_data(vertices=vv, faces=ff, color=CYL_COL)
+        _graph[0] = None
 
     # ── Main tick ─────────────────────────────────────────────────────────────
     def on_timer(_event):
@@ -500,9 +593,12 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         _omega_a = float(omega_a_wp.numpy()[0])
         _angle_a = float(angle_a_wp.numpy()[0])
 
-        status = "RUN" if running[0] else "PAUSED"
+        status     = "RUN" if running[0] else "PAUSED"
+        graph_mode = "graph" if (_USE_GRAPH and _graph[0] is not None
+                                 and _snapshot_params() == _graph_params[0]) else "loop"
         hud.text = (
-            f"[{device}]  frame {frame[0]:05d}  {status}  t={sim_time[0]:.2f}s\n"
+            f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
+            f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
             f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°\n"
             f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
