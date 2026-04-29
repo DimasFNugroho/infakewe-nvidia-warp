@@ -416,6 +416,157 @@ def project_ee(
         )
 
 
+# ── Kernel: passive roll rotation driven by yarn tension ─────────────────────
+
+@wp.kernel
+def kernel_roll_a_torque_update(
+    pos:             wp.array(dtype=wp.vec3),
+    center:          wp.vec3,
+    ra:              float,   # physical roll radius (torque arm)
+    orbit_r:         float,   # ra + ogc_r — particle sits on the OGC offset surface
+    rest_len:        float,
+    stretch_stiff:   float,
+    particle_mass:   float,
+    roll_mass:       float,
+    sub_dt:          float,
+    bearing_damping: float,   # per-substep viscous drag on omega  [0..1]
+    torque_scale:    float,   # dimensionless gain on Δω to compensate PBD overestimate
+    omega_max:       float,
+    angle:           wp.array(dtype=float),   # size-1: current departure angle
+    omega:           wp.array(dtype=float),   # size-1: current angular velocity
+):
+    """Single-thread kernel.
+
+    Reads pos[1] (yarn particle adjacent to departure) to estimate the
+    tangential tension the yarn exerts on Roll A, integrates Roll A's
+    angular velocity (I = 0.5 * M * r²), then writes the new pos[0].
+
+    Force model (PBD-compatible):
+        F ≈ particle_mass * stretch_stiff * stretch / sub_dt²
+        tau = F_tangential * ra
+        Δω  = torque_scale * tau * sub_dt / I
+            = torque_scale * particle_mass * stretch_stiff * stretch
+              * tan_comp * 2 / (roll_mass * ra * sub_dt)
+
+    bearing_damping multiplies omega each substep, acting as axle friction.
+    """
+    ang     = angle[0]
+    tangent = wp.vec3(-wp.sin(ang), wp.cos(ang), float(0.0))
+
+    seg     = pos[1] - pos[0]
+    seg_len = wp.length(seg)
+
+    new_omega = omega[0]
+    if seg_len > float(1.0e-6):
+        seg_dir   = seg / seg_len
+        stretch   = wp.max(seg_len - rest_len, float(0.0))
+        tan_comp  = wp.dot(seg_dir, tangent)
+        # Δω from tangential yarn impulse on roll surface (ra/I = 2/(M*ra))
+        delta_omega = (torque_scale * particle_mass * stretch_stiff * stretch
+                       * tan_comp * float(2.0) / (roll_mass * ra * sub_dt))
+        new_omega = new_omega + delta_omega
+
+    new_omega = new_omega * bearing_damping
+    new_omega = wp.clamp(new_omega, -omega_max, omega_max)
+    new_angle = ang + new_omega * sub_dt
+
+    omega[0] = new_omega
+    angle[0] = new_angle
+    pos[0]   = center + wp.vec3(orbit_r * wp.cos(new_angle),
+                                orbit_r * wp.sin(new_angle),
+                                float(0.0))
+
+
+def roll_a_torque_step(
+    pos:             wp.array,
+    center:          wp.vec3,
+    ra:              float,
+    orbit_r:         float,
+    rest_len:        float,
+    stretch_stiff:   float,
+    particle_mass:   float,
+    roll_mass:       float,
+    sub_dt:          float,
+    bearing_damping: float,
+    torque_scale:    float,
+    omega_max:       float,
+    angle_wp:        wp.array,
+    omega_wp:        wp.array,
+    device:          str,
+):
+    wp.launch(
+        kernel_roll_a_torque_update, dim=1, device=device,
+        inputs=[pos, center, ra, orbit_r, rest_len, stretch_stiff,
+                particle_mass, roll_mass, sub_dt,
+                bearing_damping, torque_scale, omega_max,
+                angle_wp, omega_wp],
+    )
+
+
+# ── Kernel: motor-driven roll B rotation ─────────────────────────────────────
+
+@wp.kernel
+def kernel_roll_b_motor_step(
+    pos:        wp.array(dtype=wp.vec3),
+    center:     wp.vec3,
+    rb:         float,   # physical roll radius (used for angular speed)
+    orbit_r:    float,   # rb + ogc_r — particle sits on the OGC offset surface
+    pull_speed: float,
+    sub_dt:     float,
+    n_last:     int,
+    angle:      wp.array(dtype=float),   # size-1: current winding angle
+):
+    """Advance Roll B's winding angle by pull_speed * sub_dt / rb and write pos[n_last].
+
+    Roll B is motor-driven: its angular velocity is prescribed as pull_speed / rb.
+    The yarn end (particle n_last) is placed at orbit_r = rb + ogc_r from the
+    center so it sits exactly on the OGC offset surface and OGC never fires there.
+    """
+    new_angle   = angle[0] + pull_speed * sub_dt / rb
+    angle[0]    = new_angle
+    pos[n_last] = center + wp.vec3(orbit_r * wp.cos(new_angle),
+                                   orbit_r * wp.sin(new_angle),
+                                   float(0.0))
+
+
+def roll_b_motor_step(
+    pos:        wp.array,
+    center:     wp.vec3,
+    rb:         float,
+    orbit_r:    float,
+    pull_speed: float,
+    sub_dt:     float,
+    n_last:     int,
+    angle_wp:   wp.array,
+    device:     str,
+):
+    wp.launch(
+        kernel_roll_b_motor_step, dim=1, device=device,
+        inputs=[pos, center, rb, orbit_r, pull_speed, sub_dt, n_last, angle_wp],
+    )
+
+
+# ── Kernel: set a single kinematic particle ───────────────────────────────────
+
+@wp.kernel
+def kernel_set_particle(
+    pos: wp.array(dtype=wp.vec3),
+    idx: int,
+    p:   wp.vec3,
+):
+    pos[idx] = p
+
+
+def set_particle(
+    pos:    wp.array,
+    idx:    int,
+    p:      wp.vec3,
+    device: str,
+):
+    wp.launch(kernel_set_particle, dim=1, device=device,
+              inputs=[pos, idx, p])
+
+
 # ── Kernel: set two kinematic endpoint particles ──────────────────────────────
 
 @wp.kernel

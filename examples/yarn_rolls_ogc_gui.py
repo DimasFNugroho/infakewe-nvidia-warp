@@ -51,12 +51,17 @@ DEFAULTS = {
     "roll_a_z":          0.0,
     "roll_a_radius":     0.15,
     "roll_a_mass":       0.5,    # kg — sets rotational inertia of roll A
+    "roll_a_bearing_damping": 0.98,   # per-substep drag on omega  [0..1]
+    "roll_a_torque_scale":    0.05,   # gain on yarn→roll torque (compensates PBD overestimate)
     # Roll B — pulling roll
     "roll_b_x":          0.8,
     "roll_b_y":          0.0,
     "roll_b_z":          0.0,
     "roll_b_radius":     0.15,
     "pull_speed":        0.0,    # m/s at roll B surface; negative = reverse
+    # Visualisation
+    "heatmap_mode":      0,     # 0 = stripe colours, 1 = stretch heatmap
+    "heatmap_max_strain": 0.05, # strain value that maps to full red  [0..1]
     # Guide cylinder
     "cyl_x":             0.0,
     "cyl_y":            -0.4,
@@ -81,8 +86,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     import config
     # ── Override yarn geometry for the roll-to-roll scenario ─────────────────
-    config.NUM_PARTICLES = 50
-    config.YARN_LENGTH   = 3.0
+    config.NUM_PARTICLES = 120
+    config.YARN_LENGTH   = 7.0
     config.REST_LEN      = config.YARN_LENGTH / (config.NUM_PARTICLES - 1)
 
     from ogc.mesh       import build_cylinder, mesh_for_render
@@ -91,7 +96,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     from ogc.algorithm4 import (project_vf, project_ee,
                                  apply_vf_friction, apply_ee_friction,
                                  damp_normal_velocity, clamp_velocity,
-                                 set_endpoints)
+                                 roll_a_torque_step, roll_b_motor_step,
+                                 set_particle)
     from kernels import (kernel_integrate,
                          kernel_stretch_even, kernel_stretch_odd,
                          kernel_bend, kernel_update_velocity)
@@ -119,6 +125,33 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     def make_yarn_colors(n):
         idx = (np.arange(n) // STRIPE_SIZE) % len(STRIPE_PALETTE)
         return STRIPE_PALETTE[idx]
+
+    def compute_stretch_colors(pos_np: np.ndarray) -> np.ndarray:
+        """Per-particle RGBA heatmap: blue = relaxed, yellow = moderate, red = high stretch.
+
+        Strain is normalised so that 5 % elongation maps to full red.  Each
+        particle gets the average strain of its two adjacent segments (endpoints
+        use only their single adjacent segment).
+        """
+        segs      = pos_np[1:] - pos_np[:-1]           # (N-1, 3)
+        seg_lens  = np.linalg.norm(segs, axis=1)        # (N-1,)
+        strain    = (seg_lens - config.REST_LEN) / config.REST_LEN  # (N-1,)
+
+        n = len(pos_np)
+        p_strain          = np.empty(n, dtype=np.float32)
+        p_strain[0]       = strain[0]
+        p_strain[1:-1]    = 0.5 * (strain[:-1] + strain[1:])
+        p_strain[-1]      = strain[-1]
+
+        max_strain = max(float(state.get("heatmap_max_strain", 0.05)), 1e-6)
+        t = np.clip(p_strain / max_strain, 0.0, 1.0)
+
+        # Blue (0,0,1) → Yellow (1,1,0) → Red (1,0,0)
+        r = np.where(t < 0.5, 2.0 * t,       1.0      ).astype(np.float32)
+        g = np.where(t < 0.5, 2.0 * t, 2.0 * (1.0 - t)).astype(np.float32)
+        b = np.where(t < 0.5, 1.0 - 2.0 * t, 0.0     ).astype(np.float32)
+        a = np.ones(n, dtype=np.float32)
+        return np.stack([r, g, b, a], axis=1)
 
     # ── Mutable runtime state ─────────────────────────────────────────────────
     state    = dict(defaults)
@@ -151,14 +184,46 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         return float(np.arctan2(ay - by, ax - bx))
 
     def make_initial_positions() -> np.ndarray:
-        """Straight-line yarn from Roll A departure point to Roll B attachment."""
+        """Helical winding on Roll A, then a nearly-taut free span to Roll B.
+
+        n_free is computed from the straight-line gap distance so that free-span
+        particles start at roughly REST_LEN spacing (taut).  All remaining
+        particles go to the wound section, giving more wraps and a denser
+        winding appearance.
+        """
         ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
-        ra = max(float(state["roll_a_radius"]), 1e-6)
-        p0 = np.array([ax + ra * np.cos(angle_a[0]),
-                       ay + ra * np.sin(angle_a[0]), az], dtype=np.float32)
-        pN = roll_b_attach(angle_b[0])
-        return np.array([p0 + (pN - p0) * i / (N - 1) for i in range(N)],
-                        dtype=np.float32)
+        bx, by, bz = state["roll_b_x"], state["roll_b_y"], state["roll_b_z"]
+        r         = float(state["ogc_r"])
+        orbit_r_a = max(float(state["roll_a_radius"]), 1e-6) + r
+        orbit_r_b = max(float(state["roll_b_radius"]), 1e-6) + r
+
+        # How many free-span particles are needed to cover the gap at REST_LEN?
+        center_dist = float(np.linalg.norm([bx - ax, by - ay, bz - az]))
+        free_dist   = max(center_dist - orbit_r_a - orbit_r_b, config.REST_LEN)
+        n_free  = max(2, min(int(round(free_dist / config.REST_LEN)), N - 3))
+        n_wound = N - n_free
+
+        # Angular step and small Z drift for helix separation between wraps.
+        dtheta = config.REST_LEN / orbit_r_a
+        dz     = config.REST_LEN * 0.15
+
+        positions: list = []
+        for i in range(n_wound):
+            theta = angle_a[0] + i * dtheta
+            positions.append([ax + orbit_r_a * np.cos(theta),
+                               ay + orbit_r_a * np.sin(theta),
+                               az + i * dz])
+
+        # Free span: straight line from departure point to Roll B tip.
+        p_dep = np.array(positions[-1], dtype=np.float32)
+        p_end = np.array([bx + orbit_r_b * np.cos(angle_b[0]),
+                          by + orbit_r_b * np.sin(angle_b[0]),
+                          bz], dtype=np.float32)
+        for i in range(1, n_free + 1):
+            t = i / n_free
+            positions.append(list(p_dep + t * (p_end - p_dep)))
+
+        return np.array(positions[:N], dtype=np.float32)
 
     def make_inv_mass() -> np.ndarray:
         m = max(float(state["particle_mass"]), 1e-6)
@@ -175,6 +240,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     angle_a[0] = init_angle_a()
 
     # ── Build obstacle meshes + GPU objects ───────────────────────────────────
+    # (angle_a_wp / omega_a_wp created after wp.init() below — post mesh setup)
     def _cyl(sx, sy, sz, sr):
         return build_cylinder(state[sx], state[sy], state[sz],
                               state[sr], CYL_HALF_H, n_segs=CYL_N_SEGS)
@@ -189,6 +255,11 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     # ── Yarn GPU arrays ───────────────────────────────────────────────────────
     pos_np = make_initial_positions()
+
+    # Roll rotational state on GPU — updated each substep by their respective kernels.
+    angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
+    omega_a_wp = wp.array([0.0],        dtype=float, device=device)
+    angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
 
     pos_wp      = wp.array(pos_np,                              dtype=wp.vec3, device=device)
     vel_wp      = wp.array(np.zeros((N, 3), dtype=np.float32), dtype=wp.vec3, device=device)
@@ -214,14 +285,6 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         [obs_mid, vf_mid, ee_mid],
     ]
 
-    # ── Helpers used during the simulation loop ───────────────────────────────
-
-    def set_particle(idx: int, pos3: np.ndarray):
-        """Write one particle position directly on the GPU via numpy round-trip."""
-        arr = pos_wp.numpy()
-        arr[idx] = pos3
-        pos_wp.assign(wp.array(arr, dtype=wp.vec3, device=device))
-
     def apply_state():
         config.GRAVITY         = wp.vec3(0.0, float(state["gravity_y"]), 0.0)
         config.DAMPING         = float(state["damping"])
@@ -236,6 +299,9 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         angle_b[0] = init_angle_b()
         angle_a[0] = init_angle_a()
         omega_a[0] = 0.0
+        angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
+        omega_a_wp.assign(wp.array([0.0],        dtype=float, device=device))
+        angle_b_wp.assign(wp.array([angle_b[0]], dtype=float, device=device))
         pos0 = make_initial_positions()
         pos_wp.assign(wp.array(pos0,                              dtype=wp.vec3, device=device))
         prev_pos_wp.assign(wp.array(pos0.copy(),                  dtype=wp.vec3, device=device))
@@ -254,37 +320,38 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         v_max     = float(state["v_max"])
         zero_wind = wp.vec3(0.0, 0.0, 0.0)
 
-        ax, ay, az  = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
+        ax, ay, az  = float(state["roll_a_x"]), float(state["roll_a_y"]), float(state["roll_a_z"])
         ra          = max(float(state["roll_a_radius"]), 1e-6)
         M_a         = max(float(state["roll_a_mass"]), 1e-3)
-        # Inertia time constant: heavier roll spins up and coasts more slowly.
-        tau_a       = M_a * 0.3   # seconds per kg
+        center_a    = wp.vec3(ax, ay, az)
+
+        bx, by, bz  = float(state["roll_b_x"]), float(state["roll_b_y"]), float(state["roll_b_z"])
+        rb          = max(float(state["roll_b_radius"]), 1e-6)
+        center_b    = wp.vec3(bx, by, bz)
+        # Particles sit at roll_radius + ogc_r so they rest on the OGC offset
+        # surface and the contact kernel never fires at the yarn tips.
+        orbit_r_a   = ra + r
+        orbit_r_b   = rb + r
 
         for _ in range(config.SUBSTEPS):
-            # ── Roll A: kinematic coupling from yarn conservation ─────────────
-            # The yarn is nearly inextensible (PBD stretch ≈ 0), so Roll A must
-            # pay out yarn at exactly the same surface speed as Roll B consumes
-            # it.  omega_target = pull_speed / ra follows from this constraint.
-            # A first-order lag (τ = roll_a_mass × 0.3 s/kg) gives the inertia
-            # effect: zero pull_speed → omega_target = 0 → omega_a → 0.
-            omega_target = float(state["pull_speed"]) / ra
-            alpha        = sub_dt / (sub_dt + tau_a)
-            omega_a[0]   = omega_a[0] * (1.0 - alpha) + omega_target * alpha
-            omega_a[0]   = max(-200.0, min(200.0, omega_a[0]))
-            angle_a[0]  += omega_a[0] * sub_dt
+            # ── Roll A: passive rotation from yarn tension (revolute joint) ───
+            roll_a_torque_step(
+                pos_wp, center_a, ra, orbit_r_a,
+                config.REST_LEN, config.STRETCH_STIFF,
+                float(state["particle_mass"]), M_a,
+                sub_dt,
+                float(state["roll_a_bearing_damping"]),
+                float(state["roll_a_torque_scale"]),
+                200.0,
+                angle_a_wp, omega_a_wp, device,
+            )
 
-            p0_wp = wp.vec3(ax + ra * float(np.cos(angle_a[0])),
-                            ay + ra * float(np.sin(angle_a[0])),
-                            az)
-
-            # ── Roll B advance ────────────────────────────────────────────────
-            rb = max(float(state["roll_b_radius"]), 1e-6)
-            angle_b[0] += float(state["pull_speed"]) * sub_dt / rb
-            pN = roll_b_attach(angle_b[0])
-            pN_wp = wp.vec3(float(pN[0]), float(pN[1]), float(pN[2]))
-
-            # ── Set kinematic endpoints on GPU — no CPU round-trip ────────────
-            set_endpoints(pos_wp, p0_wp, pN_wp, N - 1, device)
+            # ── Roll B: motor-driven at pull_speed, sets pos[N-1] on GPU ─────
+            roll_b_motor_step(
+                pos_wp, center_b, rb, orbit_r_b,
+                float(state["pull_speed"]), sub_dt,
+                N - 1, angle_b_wp, device,
+            )
 
             # ── Predict ───────────────────────────────────────────────────────
             wp.launch(kernel_integrate, dim=N, device=device,
@@ -424,15 +491,20 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             frame[0] += 1
 
         pp = pos_wp.numpy()
-        yarn_line.set_data(pos=pp)
+        col = compute_stretch_colors(pp) if state.get("heatmap_mode") else yarn_colors
+        yarn_line.set_data(pos=pp, color=col)
         marker_a.set_data(pp[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
         marker_b.set_data(pp[-1:], face_color=PULL_COL,   size=14, edge_width=0)
+
+        # Read Roll A state from GPU once per frame (not per substep).
+        _omega_a = float(omega_a_wp.numpy()[0])
+        _angle_a = float(angle_a_wp.numpy()[0])
 
         status = "RUN" if running[0] else "PAUSED"
         hud.text = (
             f"[{device}]  frame {frame[0]:05d}  {status}  t={sim_time[0]:.2f}s\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
-            f"ωA={omega_a[0]:+.1f} rad/s  θA={np.degrees(angle_a[0]):.0f}°\n"
+            f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°\n"
             f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
             f"iter={config.CONSTRAINT_ITER}"
         )
@@ -447,12 +519,13 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 # ── Tkinter control panel (parent process) ────────────────────────────────────
 
 def run_ui(cmd_queue):
+    import json
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import ttk, filedialog
 
     root = tk.Tk()
     root.title("OGC roll-to-roll yarn — controls")
-    root.geometry("480x680")
+    root.geometry("780x720")
 
     # ── Scrollable slider area ────────────────────────────────────────────────
     outer = ttk.Frame(root)
@@ -466,10 +539,16 @@ def run_ui(cmd_queue):
         "<Configure>",
         lambda e: canvas_tk.configure(scrollregion=canvas_tk.bbox("all")),
     )
-    canvas_tk.create_window((0, 0), window=scroll_frm, anchor="nw")
+    win_id = canvas_tk.create_window((0, 0), window=scroll_frm, anchor="nw")
     canvas_tk.configure(yscrollcommand=scrollbar.set)
     canvas_tk.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
+
+    # Keep scroll_frm width in sync with the canvas so sliders fill the window.
+    canvas_tk.bind(
+        "<Configure>",
+        lambda e: canvas_tk.itemconfig(win_id, width=e.width),
+    )
 
     # Mouse-wheel scrolling (Windows + Linux).
     canvas_tk.bind_all("<MouseWheel>",
@@ -478,6 +557,10 @@ def run_ui(cmd_queue):
                        lambda e: canvas_tk.yview_scroll(-1, "units"))
     canvas_tk.bind_all("<Button-5>",
                        lambda e: canvas_tk.yview_scroll( 1, "units"))
+
+    # Registries used by save / load.
+    param_vars      = {}   # key → DoubleVar
+    param_callbacks = {}   # key → on_change(v)
 
     def add_slider(label, key, from_, to_, default, is_int=False, fmt="{:.3f}"):
         frm = ttk.Frame(scroll_frm)
@@ -506,10 +589,17 @@ def run_ui(cmd_queue):
             side="left", fill="x", expand=True, padx=6,
         )
 
+        param_vars[key]      = val_var
+        param_callbacks[key] = on_change
+
     def section(title):
         ttk.Label(scroll_frm, text=title, font=("", 10, "bold")).pack(
             anchor="w", padx=8, pady=(10, 0)
         )
+
+    section("Visualisation")
+    add_slider("Heatmap max strain", "heatmap_max_strain", 0.001, 1.0,
+               DEFAULTS["heatmap_max_strain"], fmt="{:.3f}")
 
     section("Physics")
     add_slider("Gravity Y",          "gravity_y",      -20.0,  0.0,  DEFAULTS["gravity_y"],   fmt="{:+.2f}")
@@ -533,6 +623,10 @@ def run_ui(cmd_queue):
     add_slider("Roll A  Z",       "roll_a_z",      -3.0,  3.0,  DEFAULTS["roll_a_z"],      fmt="{:+.3f}")
     add_slider("Roll A  radius",  "roll_a_radius",  0.02, 0.5,  DEFAULTS["roll_a_radius"])
     add_slider("Roll A  mass (kg)", "roll_a_mass",  0.01, 5.0,  DEFAULTS["roll_a_mass"])
+    add_slider("Roll A  bearing damp", "roll_a_bearing_damping", 0.0, 1.0,
+               DEFAULTS["roll_a_bearing_damping"])
+    add_slider("Roll A  torque scale", "roll_a_torque_scale",    0.0, 1.0,
+               DEFAULTS["roll_a_torque_scale"])
 
     section("Roll B — pulling roll")
     add_slider("Roll B  X",      "roll_b_x",      -3.0,  3.0, DEFAULTS["roll_b_x"],      fmt="{:+.3f}")
@@ -547,13 +641,61 @@ def run_ui(cmd_queue):
     add_slider("Guide Z",      "cyl_z",      -3.0,  3.0, DEFAULTS["cyl_z"],      fmt="{:+.3f}")
     add_slider("Guide radius", "cyl_radius",  0.02, 0.5, DEFAULTS["cyl_radius"])
 
+    # ── Save / Load ───────────────────────────────────────────────────────────
+
+    def save_params():
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="params.json",
+            title="Save parameters",
+        )
+        if not path:
+            return
+        data = {k: v.get() for k, v in param_vars.items()}
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[ui] saved parameters to {path}", flush=True)
+
+    def load_params():
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Load parameters",
+        )
+        if not path:
+            return
+        with open(path) as f:
+            data = json.load(f)
+        for key, value in data.items():
+            if key in param_vars and key in param_callbacks:
+                param_vars[key].set(value)
+                param_callbacks[key](value)
+        print(f"[ui] loaded parameters from {path}", flush=True)
+
     # ── Buttons (pinned to the bottom, outside the scroll area) ──────────────
     def send(cmd: str):
         print(f"[ui] send: {cmd}", flush=True)
         cmd_queue.put((cmd,))
 
     btn_frm = ttk.Frame(root)
-    btn_frm.pack(fill="x", padx=8, pady=8, side="bottom")
+    btn_frm.pack(fill="x", padx=8, pady=(4, 8), side="bottom")
+
+    io_frm = ttk.Frame(root)
+    io_frm.pack(fill="x", padx=8, pady=(0, 2), side="bottom")
+    ttk.Button(io_frm, text="Save params", command=save_params
+               ).pack(side="left", expand=True, fill="x", padx=2)
+    ttk.Button(io_frm, text="Load params", command=load_params
+               ).pack(side="left", expand=True, fill="x", padx=2)
+
+    vis_frm = ttk.Frame(root)
+    vis_frm.pack(fill="x", padx=8, pady=(0, 2), side="bottom")
+    heatmap_var = tk.IntVar(value=DEFAULTS["heatmap_mode"])
+    ttk.Checkbutton(
+        vis_frm, text="Stretch heatmap  (blue = relaxed → yellow → red = high stretch)",
+        variable=heatmap_var,
+        command=lambda: cmd_queue.put(("param", "heatmap_mode", heatmap_var.get())),
+    ).pack(side="left", padx=4)
+
     ttk.Button(btn_frm, text="Start", command=lambda: send("start")
                ).pack(side="left", expand=True, fill="x", padx=2)
     ttk.Button(btn_frm, text="Pause", command=lambda: send("pause")
