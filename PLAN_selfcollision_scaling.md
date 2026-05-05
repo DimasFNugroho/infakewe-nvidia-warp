@@ -104,26 +104,7 @@ This is the primary bottleneck — not FLOPs, not memory bandwidth.
 
 ---
 
-### Phase 3 — Conservative-Bound Redetection
-
-**Goal**: Avoid re-running VF and EE detection every substep when particles haven't moved enough.
-
-**How it works (from OGC paper)**:
-- After detection, record each particle's position at detection time in a `pos_det` buffer.
-- At the start of each substep, check if `|pos - pos_det| > threshold` (e.g., `0.5 * r`).
-- Only re-run detection if any particle exceeds the threshold.
-- Otherwise, reuse the contact list from the previous detection.
-
-**Expected gain**: 3–10× fewer detection passes in low-motion frames. Especially useful for the yarn wound on Roll A which moves slowly.
-
-**Deliverables**:
-- `pos_det_wp` buffer in `OGCSimulation`.
-- Per-substep "dirty check" kernel → single scalar flag.
-- Conditional detection call.
-
----
-
-### Phase 4 — Particle Scaling
+### Phase 3 — Particle Scaling
 
 **Goal**: Increase N to demonstrate multi-layer winding clearly.
 
@@ -133,8 +114,8 @@ This is the primary bottleneck — not FLOPs, not memory bandwidth.
 |-------------------|-----------|----------|-----------------|-----------|---------------------|
 | Current           | 120       | 20       | 10              | No        | ~60 (est.)          |
 | T1 (Phase 1 only) | 500       | 20       | 10              | No        | ~60                 |
-| T2 (Phase 1+2)    | 2000      | 15       | 8               | Yes       | ~60                 |
-| T3 (Phase 1+2+3)  | 5000      | 12       | 6               | Yes       | ~45–60              |
+| T2 (Phase 1+2+3)  | 2000      | 15       | 8               | Yes       | ~60                 |
+| T3 (Phase 1+2+3+4)| 5000      | 12       | 6               | Yes       | ~45–60              |
 
 **Substeps vs constraint_iter tradeoff**:
 - **Substeps** are more important for contact stability (finer `dt` = less penetration).
@@ -146,6 +127,25 @@ This is the primary bottleneck — not FLOPs, not memory bandwidth.
 - More wraps = larger `n_wound` = higher `N` with the same `n_free`.
 - At N=500, REST_LEN = 7.0/499 ≈ 0.014 m. With orbit_r_a ≈ 0.17 m, `dtheta = 0.014/0.17 ≈ 0.083 rad` → **~75 particles per full turn** → with 400 wound particles → ~5 full turns.
 - At N=2000, wound particles could give 15–20 visible turns.
+
+---
+
+### Phase 4 — Conservative-Bound Redetection
+
+**Goal**: Avoid re-running VF and EE detection every substep when particles haven't moved enough.
+
+**How it works (from OGC paper)**:
+- After detection, record each particle's position at detection time in a `pos_det` buffer.
+- At the start of each substep, check if `|pos - pos_det| > threshold` (e.g., `0.5 * r`).
+- Only re-run detection if any particle exceeds the threshold.
+- Otherwise, reuse the contact list from the previous detection.
+
+**Expected gain**: 3–10× fewer detection passes in low-motion frames. Especially useful for the yarn wound on Roll A which moves slowly. Only meaningful at large N where detection is expensive.
+
+**Deliverables**:
+- `pos_det_wp` buffer in `OGCSimulation`.
+- Per-substep "dirty check" kernel → single scalar flag.
+- Conditional detection call.
 
 ---
 
@@ -178,10 +178,10 @@ This is the primary bottleneck — not FLOPs, not memory bandwidth.
 
 Before moving from one phase to the next:
 
-- **Phase 1 → Phase 2**: `wp.ScopedTimer` confirms ≥ 3× wall-time reduction for the substep loop.
+- **Phase 1 → Phase 2**: `wp.ScopedTimer` confirms ≥ 3× wall-time reduction for the substep loop. ✓ (6 ms at 200 substeps)
 - **Phase 2 → Phase 3**: Yarn-on-yarn penetration visually absent in a "figure-eight cross" stress test. No regression in single-strand winding.
-- **Phase 3 → Phase 4**: Stable 60 FPS at T2 (2000 particles) confirmed over 500 frames without blow-up.
-- **Phase 4 done**: T3 (5000 particles) achieves ≥ 45 FPS; winding shows ≥ 10 visible turns on Roll A.
+- **Phase 3 → Phase 4**: Stable 60 FPS at T2 (2000 particles) confirmed over 500 frames without blow-up. If FPS is already acceptable, Phase 4 may be skipped.
+- **Phase 4 done**: Detection pass count reduced ≥ 3× vs. every-substep baseline at T2.
 
 ---
 
