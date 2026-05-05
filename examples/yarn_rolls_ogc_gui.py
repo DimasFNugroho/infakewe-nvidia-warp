@@ -31,6 +31,9 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ── Shared parameter defaults ─────────────────────────────────────────────────
 
 DEFAULTS = {
+    # Yarn geometry
+    "yarn_length":       7.0,    # metres — N is derived automatically from this and ogc_r
+    "particle_density":  30.0,   # % of max stable particle count (0=coarse, 100=max density)
     # Physics
     "gravity_y":        -9.81,
     "particle_mass":     0.01,
@@ -42,6 +45,7 @@ DEFAULTS = {
     # OGC contact
     "ogc_r":             0.005,
     "ogc_stiff":         1.0,
+    "self_ee_stiff":     0.3,   # stiffness for yarn self-collision projection (separate from obstacle)
     "mu_static":         0.4,
     "mu_kinetic":        0.2,
     "v_max":             20.0,
@@ -59,6 +63,8 @@ DEFAULTS = {
     "roll_b_z":          0.0,
     "roll_b_radius":     0.15,
     "pull_speed":        0.0,    # m/s at roll B surface; negative = reverse
+    # Self-collision
+    "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     # Visualisation
     "heatmap_mode":      0,     # 0 = stripe colours, 1 = stretch heatmap
     "heatmap_max_strain": 0.05, # strain value that maps to full red  [0..1]
@@ -87,8 +93,10 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     import config
     # ── Override yarn geometry for the roll-to-roll scenario ─────────────────
-    config.NUM_PARTICLES = 120
-    config.YARN_LENGTH   = 7.0
+    config.YARN_LENGTH   = float(defaults.get("yarn_length", 7.0))
+    _n_max = max(4, int(config.YARN_LENGTH / float(defaults.get("ogc_r", 0.005))))
+    _pct   = max(0.0, min(100.0, float(defaults.get("particle_density", 30.0))))
+    config.NUM_PARTICLES = max(4, round(4 + (_pct / 100.0) * (_n_max - 4)))
     config.REST_LEN      = config.YARN_LENGTH / (config.NUM_PARTICLES - 1)
 
     from ogc.mesh       import build_cylinder, mesh_for_render
@@ -99,6 +107,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                                  damp_normal_velocity, clamp_velocity,
                                  roll_a_torque_step, roll_b_motor_step,
                                  set_particle)
+    from ogc.algorithm5 import SelfEEContacts, detect_self_ee
+    from ogc.algorithm6 import project_self_ee, apply_self_ee_friction
     from kernels import (kernel_integrate,
                          kernel_stretch_even, kernel_stretch_odd,
                          kernel_bend, kernel_update_velocity)
@@ -106,7 +116,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     # ── Scene / rendering constants ───────────────────────────────────────────
     CYL_HALF_H = 1.5
     CYL_N_SEGS = 48
-    N          = config.NUM_PARTICLES
+    N          = config.NUM_PARTICLES   # reassigned by do_reinit on num_particles change
 
     BG_COL     = (0.07, 0.07, 0.13, 1.0)
     ROLL_A_COL = (0.20, 0.50, 0.90, 0.80)   # blue  — feeding roll
@@ -204,9 +214,9 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         n_free  = max(2, min(int(round(free_dist / config.REST_LEN)), N - 3))
         n_wound = N - n_free
 
-        # Angular step and small Z drift for helix separation between wraps.
+        # Angular step and Z drift per segment so adjacent wraps sit one yarn-diameter apart.
         dtheta = config.REST_LEN / orbit_r_a
-        dz     = config.REST_LEN * 0.15
+        dz     = 2.0 * r * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
 
         positions: list = []
         for i in range(n_wound):
@@ -279,12 +289,67 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     vf_b   = VFContacts(N, device);   ee_b   = EEContacts(N - 1, device)
     vf_mid = VFContacts(N, device);   ee_mid = EEContacts(N - 1, device)
 
+    # Self-collision contact array (yarn vs. yarn).
+    self_ee = SelfEEContacts(N - 1, device)
+
     # List-of-lists so individual obstacles can be hot-swapped.
     contacts = [
         [obs_a,   vf_a,   ee_a],
         [obs_b,   vf_b,   ee_b],
         [obs_mid, vf_mid, ee_mid],
     ]
+
+    # ── Particle-count reinit ─────────────────────────────────────────────────
+    # Called when the num_particles slider changes. Rebinds all N-dependent GPU
+    # arrays via nonlocal so that every other closure sees the new arrays on its
+    # next call — no changes required in _execute_substeps or sim_reset.
+
+    def do_reinit(new_N: int):
+        nonlocal N, n_even, n_odd, n_bend
+        nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
+        nonlocal angle_a_wp, omega_a_wp, angle_b_wp
+        nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
+        nonlocal yarn_colors
+
+        N = max(4, new_N)
+        config.NUM_PARTICLES = N
+        config.REST_LEN      = config.YARN_LENGTH / (N - 1)
+        n_even = N // 2
+        n_odd  = (N - 1) // 2
+        n_bend = N - 2
+
+        angle_b[0] = init_angle_b()
+        angle_a[0] = init_angle_a()
+        angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
+        omega_a_wp = wp.array([0.0],        dtype=float, device=device)
+        angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
+
+        pos_np      = make_initial_positions()
+        pos_wp      = wp.array(pos_np,                               dtype=wp.vec3, device=device)
+        vel_wp      = wp.array(np.zeros((N, 3), dtype=np.float32),   dtype=wp.vec3, device=device)
+        prev_pos_wp = wp.array(pos_np.copy(),                        dtype=wp.vec3, device=device)
+        inv_mass_wp = wp.array(make_inv_mass(),                      dtype=float,   device=device)
+
+        edges_np      = np.stack([np.arange(N - 1), np.arange(1, N)], axis=1).astype(np.int32)
+        yarn_edges_wp = wp.array(edges_np, dtype=wp.vec2i, device=device)
+
+        vf_a   = VFContacts(N, device);   ee_a   = EEContacts(N - 1, device)
+        vf_b   = VFContacts(N, device);   ee_b   = EEContacts(N - 1, device)
+        vf_mid = VFContacts(N, device);   ee_mid = EEContacts(N - 1, device)
+        self_ee = SelfEEContacts(N - 1, device)
+
+        # Preserve existing obstacle GPU objects; only contact arrays change.
+        contacts = [
+            [contacts[0][0], vf_a,   ee_a],
+            [contacts[1][0], vf_b,   ee_b],
+            [contacts[2][0], vf_mid, ee_mid],
+        ]
+
+        yarn_colors = make_yarn_colors(N)
+        _graph[0]   = None
+        sim_time[0] = 0.0
+        frame[0]    = 0
+        print(f"[sim] reinit: N={N}  REST_LEN={config.REST_LEN:.5f}", flush=True)
 
     # ── CUDA graph capture state ──────────────────────────────────────────────
     # Replaying a captured graph eliminates Python kernel-launch overhead
@@ -339,6 +404,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             "bend_stiff":             float(state["bend_stiff"]),
             "ogc_r":                  float(state["ogc_r"]),
             "ogc_stiff":              float(state["ogc_stiff"]),
+            "self_ee_stiff":          float(state.get("self_ee_stiff", 0.3)),
             "mu_static":              float(state["mu_static"]),
             "mu_kinetic":             float(state["mu_kinetic"]),
             "v_max":                  float(state["v_max"]),
@@ -355,6 +421,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             "roll_b_y":               float(state["roll_b_y"]),
             "roll_b_z":               float(state["roll_b_z"]),
             "roll_b_radius":          float(state["roll_b_radius"]),
+            "self_collision":         int(state.get("self_collision", 1)),
         }
 
     def _execute_substeps():
@@ -365,14 +432,16 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         into the recorded graph nodes.  In Python-fallback mode they execute
         immediately with the current state values.
         """
-        sub_dt    = config.DT / config.SUBSTEPS
-        inv_sdt   = 1.0 / sub_dt
-        r         = float(state["ogc_r"])
-        stiff     = float(state["ogc_stiff"])
-        mu_s      = float(state["mu_static"])
-        mu_k      = float(state["mu_kinetic"])
-        v_max     = float(state["v_max"])
-        zero_wind = wp.vec3(0.0, 0.0, 0.0)
+        sub_dt        = config.DT / config.SUBSTEPS
+        inv_sdt       = 1.0 / sub_dt
+        r             = float(state["ogc_r"])
+        stiff         = float(state["ogc_stiff"])
+        self_ee_stiff = float(state.get("self_ee_stiff", 0.3))
+        mu_s          = float(state["mu_static"])
+        mu_k          = float(state["mu_kinetic"])
+        v_max         = float(state["v_max"])
+        self_coll_on  = bool(int(state.get("self_collision", 1)))
+        zero_wind     = wp.vec3(0.0, 0.0, 0.0)
 
         ax, ay, az = float(state["roll_a_x"]), float(state["roll_a_y"]), float(state["roll_a_z"])
         ra         = max(float(state["roll_a_radius"]), 1e-6)
@@ -405,6 +474,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             for obs, vf, ee in contacts:
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
+            if self_coll_on:
+                detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device)
             for _k in range(config.CONSTRAINT_ITER):
                 wp.launch(kernel_stretch_even, dim=n_even, device=device,
                           inputs=[pos_wp, inv_mass_wp, config.REST_LEN, config.STRETCH_STIFF])
@@ -415,11 +486,17 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                 for obs, vf, ee in contacts:
                     project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
                     project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
+                if self_coll_on:
+                    project_self_ee(pos_wp, inv_mass_wp, yarn_edges_wp,
+                                    self_ee, r, self_ee_stiff, device)
             for obs, vf, ee in contacts:
                 apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   vf, r, mu_s, mu_k, device)
                 apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   yarn_edges_wp, ee, r, mu_s, mu_k, device)
+            if self_coll_on:
+                apply_self_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                                       yarn_edges_wp, self_ee, r, mu_s, mu_k, device)
             wp.launch(kernel_update_velocity, dim=N, device=device,
                       inputs=[pos_wp, prev_pos_wp, vel_wp, inv_mass_wp, inv_sdt])
             for obs, vf, ee in contacts:
@@ -575,7 +652,20 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                 elif kind == "param":
                     key, value = cmd[1], cmd[2]
                     state[key] = value
-                    if key in ("roll_a_x", "roll_a_y", "roll_a_z", "roll_a_radius"):
+
+                    def _auto_reinit():
+                        """Recompute N from yarn_length, ogc_r, and particle_density, then reinit."""
+                        config.YARN_LENGTH = float(state["yarn_length"])
+                        n_max = max(4, int(config.YARN_LENGTH / float(state["ogc_r"])))
+                        pct   = max(0.0, min(100.0, float(state.get("particle_density", 30.0))))
+                        new_N = max(4, round(4 + (pct / 100.0) * (n_max - 4)))
+                        do_reinit(new_N)
+                        yarn_line.set_data(pos=pos_wp.numpy(), color=yarn_colors,
+                                           connect="strip")
+
+                    if key in ("yarn_length", "ogc_r", "particle_density"):
+                        _auto_reinit()
+                    elif key in ("roll_a_x", "roll_a_y", "roll_a_z", "roll_a_radius"):
                         rebuild_roll_a()
                     elif key in ("roll_b_x", "roll_b_y", "roll_b_z", "roll_b_radius"):
                         rebuild_roll_b()
@@ -611,8 +701,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             if graph_mode == "loop" else ""
         )
         hud.text = (
-            f"r={state['ogc_r']:.3f}  substeps={config.SUBSTEPS}  "
-            f"iter={config.CONSTRAINT_ITER}\n"
+            f"N={N}  seg={config.REST_LEN*1000:.1f}mm  r={state['ogc_r']:.3f}  "
+            f"substeps={config.SUBSTEPS}  iter={config.CONSTRAINT_ITER}\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
             f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°\n"
             f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
@@ -711,6 +801,30 @@ def run_ui(cmd_queue):
     add_slider("Heatmap max strain", "heatmap_max_strain", 0.001, 1.0,
                DEFAULTS["heatmap_max_strain"], fmt="{:.3f}")
 
+    section("Yarn geometry")
+    _n_label_var = tk.StringVar(value="N = (computing...)")
+
+    def _update_n_label():
+        yl  = float(param_vars["yarn_length"].get())       if "yarn_length"       in param_vars else DEFAULTS["yarn_length"]
+        ogr = float(param_vars["ogc_r"].get())             if "ogc_r"             in param_vars else DEFAULTS["ogc_r"]
+        pct = float(param_vars["particle_density"].get())  if "particle_density"  in param_vars else DEFAULTS["particle_density"]
+        n_max = max(4, int(yl / ogr))
+        n     = max(4, round(4 + (pct / 100.0) * (n_max - 4)))
+        _n_label_var.set(f"N = {n} particles  (max {n_max})")
+
+    add_slider("Yarn length (m)", "yarn_length", 0.5, 60.0, DEFAULTS["yarn_length"],
+               fmt="{:.2f}")
+    param_vars["yarn_length"].trace_add("write", lambda *_: _update_n_label())
+    add_slider("Particle density (%)", "particle_density", 10.0, 100.0,
+               DEFAULTS["particle_density"], fmt="{:.1f}")
+    param_vars["particle_density"].trace_add("write", lambda *_: _update_n_label())
+
+    _n_frm = ttk.Frame(scroll_frm)
+    _n_frm.pack(fill="x", padx=8, pady=2)
+    ttk.Label(_n_frm, text="Particles (auto)", width=22).pack(side="left")
+    ttk.Label(_n_frm, textvariable=_n_label_var, foreground="blue").pack(side="left")
+    _update_n_label()  # populate immediately on startup
+
     section("Physics")
     add_slider("Gravity Y",          "gravity_y",      -20.0,  0.0,  DEFAULTS["gravity_y"],   fmt="{:+.2f}")
     add_slider("Particle mass (kg)", "particle_mass",    0.001, 10.0, DEFAULTS["particle_mass"], fmt="{:.4f}")
@@ -722,10 +836,21 @@ def run_ui(cmd_queue):
 
     section("OGC contact")
     add_slider("Contact radius r (m)", "ogc_r",        0.001, 0.20, DEFAULTS["ogc_r"],      fmt="{:.4f}")
+    param_vars["ogc_r"].trace_add("write", lambda *_: _update_n_label())
     add_slider("Contact stiffness",    "ogc_stiff",    0.0,   1.0,  DEFAULTS["ogc_stiff"])
     add_slider("Friction μ_static",    "mu_static",    0.0,   1.0,  DEFAULTS["mu_static"])
     add_slider("Friction μ_kinetic",   "mu_kinetic",   0.0,   1.0,  DEFAULTS["mu_kinetic"])
     add_slider("Velocity max (m/s)",   "v_max",        0.0,  100.0, DEFAULTS["v_max"],       fmt="{:.1f}")
+
+    section("Yarn self-collision")
+    _self_coll_var = tk.IntVar(value=DEFAULTS["self_collision"])
+    _self_coll_frm = ttk.Frame(scroll_frm)
+    _self_coll_frm.pack(fill="x", padx=8, pady=3)
+    def _on_self_coll():
+        cmd_queue.put(("param", "self_collision", _self_coll_var.get()))
+    ttk.Checkbutton(_self_coll_frm, text="Enable yarn self-collision",
+                    variable=_self_coll_var, command=_on_self_coll).pack(side="left")
+    add_slider("Self-collision stiffness", "self_ee_stiff", 0.0, 1.0, DEFAULTS["self_ee_stiff"])
 
     section("Roll A — feeding roll (freely rotating)")
     add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
@@ -780,6 +905,7 @@ def run_ui(cmd_queue):
             if key in param_vars and key in param_callbacks:
                 param_vars[key].set(value)
                 param_callbacks[key](value)
+        _update_n_label()
         print(f"[ui] loaded parameters from {path}", flush=True)
 
     # ── Buttons (pinned to the bottom, outside the scroll area) ──────────────
