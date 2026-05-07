@@ -486,6 +486,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             wp.launch(kernel_integrate, dim=N, device=device,
                       inputs=[pos_wp, vel_wp, prev_pos_wp, inv_mass_wp,
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
+            # Re-detect contacts every substep so projections use fresh contacts.
+            # (Detection kernels are GPU-only and safe inside a CUDA graph.)
+            for obs, vf, ee in contacts:
+                detect_vertex_facet(pos_wp, obs, vf, r, device)
+                detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
+            if self_coll_on:
+                detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device,
+                               n_wound=n_wound)
             for _k in range(config.CONSTRAINT_ITER):
                 wp.launch(kernel_stretch_even, dim=n_even, device=device,
                           inputs=[pos_wp, inv_mass_wp, config.REST_LEN, config.STRETCH_STIFF])
@@ -524,7 +532,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             clamp_velocity(vel_wp, v_max, device)
 
     def _detect_contacts():
-        """Run all contact detection and snapshot pos_det for conservative-bound tracking."""
+        """Seed contact arrays once (on init/reset) before the substep loop runs."""
         r = float(state["ogc_r"])
         self_coll = bool(int(state.get("self_collision", 1)))
         for obs, vf, ee in contacts:
@@ -532,7 +540,6 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
         if self_coll:
             detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device, n_wound=n_wound)
-        wp.copy(pos_det_wp, pos_wp)
         _force_redetect[0] = False
 
     def _rebuild_graph():
@@ -556,23 +563,10 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     def sim_step():
         t0 = time.perf_counter()
 
-        # ── Conservative-bound redetection (Phase 4) ─────────────────────────
-        # Detection runs outside the CUDA graph (graphs can't branch).
-        # We skip detection when max particle displacement since the last
-        # detection pass is below threshold * r — a conservative bound that
-        # guarantees no contact is missed by more than the OGC radius.
-        r            = float(state["ogc_r"])
-        threshold_sq = (float(state.get("redetect_threshold", 0.3)) * r) ** 2
+        # Seed contact arrays on first frame after reset/reinit so the CUDA
+        # graph has valid (non-empty) contact lists from the very first substep.
         if _force_redetect[0]:
             _detect_contacts()
-        else:
-            wp.launch(kernel_reset_scalar, dim=1, device=device,
-                      inputs=[max_disp_buf])
-            wp.launch(kernel_max_disp_sq, dim=N, device=device,
-                      inputs=[pos_wp, pos_det_wp, max_disp_buf])
-            if max_disp_buf.numpy()[0] > threshold_sq:
-                _detect_contacts()
-        # ─────────────────────────────────────────────────────────────────────
 
         if _USE_GRAPH:
             snap = _snapshot_params()
