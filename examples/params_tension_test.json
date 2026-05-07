@@ -30,5 +30,7 @@
   "cyl_x": 0.0,
   "cyl_y": -0.32444444444444454,
   "cyl_z": -0.03111111111111109,
-  "cyl_radius": 0.08
+  "cyl_radius": 0.08,
+  "self_collision": 1,
+  "heatmap_mode": 0
 }

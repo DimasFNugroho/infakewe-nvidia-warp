@@ -32,46 +32,46 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULTS = {
     # Yarn geometry
-    "yarn_length":       7.0,    # metres — N is derived automatically from this and ogc_r
-    "particle_density":  30.0,   # % of max stable particle count (0=coarse, 100=max density)
+    "yarn_length":       50.02465483234714,   # metres — N is derived automatically from this and ogc_r
+    "particle_density":  14.956803455723541,  # % of max stable particle count (10=coarse, 100=max density)
     # Physics
     "gravity_y":        -9.81,
-    "particle_mass":     0.01,
-    "damping":           0.996,
-    "stretch_stiff":     1.0,
+    "particle_mass":     0.001,
+    "damping":           0.9994074074074074,
+    "stretch_stiff":     0.30303030303030304,
     "bend_stiff":        0.0,
-    "substeps":          20,
+    "substeps":          104,
     "constraint_iter":   1,
     # OGC contact
     "ogc_r":             0.005,
     "ogc_stiff":         1.0,
-    "self_ee_stiff":     0.3,   # stiffness for yarn self-collision projection (separate from obstacle)
-    "mu_static":         0.4,
-    "mu_kinetic":        0.2,
+    "self_ee_stiff":     0.2938856015779093,  # stiffness for yarn self-collision projection
+    "mu_static":         0.10907127429805616,
+    "mu_kinetic":        0.011879049676025918,
     "v_max":             20.0,
     # Roll A — feeding roll
     "roll_a_x":         -0.8,
     "roll_a_y":          0.0,
     "roll_a_z":          0.0,
     "roll_a_radius":     0.15,
-    "roll_a_mass":       0.5,    # kg — sets rotational inertia of roll A
-    "roll_a_bearing_damping": 0.98,   # per-substep drag on omega  [0..1]
-    "roll_a_torque_scale":    0.05,   # gain on yarn→roll torque (compensates PBD overestimate)
+    "roll_a_mass":       0.5219330453563715,  # kg — sets rotational inertia of roll A
+    "roll_a_bearing_damping": 0.9978401727861771,  # per-substep drag on omega  [0..1]
+    "roll_a_torque_scale":    1.0,                 # gain on yarn→roll torque
     # Roll B — pulling roll
     "roll_b_x":          0.8,
-    "roll_b_y":          0.0,
-    "roll_b_z":          0.0,
+    "roll_b_y":         -0.36363636363636376,
+    "roll_b_z":          0.9090909090909092,
     "roll_b_radius":     0.15,
-    "pull_speed":        0.0,    # m/s at roll B surface; negative = reverse
+    "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     # Visualisation
     "heatmap_mode":      0,     # 0 = stripe colours, 1 = stretch heatmap
-    "heatmap_max_strain": 0.05, # strain value that maps to full red  [0..1]
+    "heatmap_max_strain": 0.1099622030237581,
     # Guide cylinder
     "cyl_x":             0.0,
-    "cyl_y":            -0.4,
-    "cyl_z":             0.0,
+    "cyl_y":            -0.32444444444444454,
+    "cyl_z":            -0.03111111111111109,
     "cyl_radius":        0.08,
 }
 
@@ -864,6 +864,10 @@ def run_ui(cmd_queue):
         cmd_queue.put(("param", "self_collision", _self_coll_var.get()))
     ttk.Checkbutton(_self_coll_frm, text="Enable yarn self-collision",
                     variable=_self_coll_var, command=_on_self_coll).pack(side="left")
+    param_vars["self_collision"]      = _self_coll_var
+    param_callbacks["self_collision"] = lambda v: (
+        _self_coll_var.set(int(v)), cmd_queue.put(("param", "self_collision", int(v)))
+    )
     add_slider("Self-collision stiffness", "self_ee_stiff", 0.0, 1.0, DEFAULTS["self_ee_stiff"])
 
     section("Roll A — feeding roll (freely rotating)")
@@ -945,6 +949,10 @@ def run_ui(cmd_queue):
         variable=heatmap_var,
         command=lambda: cmd_queue.put(("param", "heatmap_mode", heatmap_var.get())),
     ).pack(side="left", padx=4)
+    param_vars["heatmap_mode"]      = heatmap_var
+    param_callbacks["heatmap_mode"] = lambda v: (
+        heatmap_var.set(int(v)), cmd_queue.put(("param", "heatmap_mode", int(v)))
+    )
 
     ttk.Button(btn_frm, text="Start", command=lambda: send("start")
                ).pack(side="left", expand=True, fill="x", padx=2)
