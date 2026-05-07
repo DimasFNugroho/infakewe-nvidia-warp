@@ -1151,10 +1151,14 @@ def run_ui(cmd_queue, shared):
               foreground="white", background="#1e1e1e").pack(anchor="w")
     info_frm.configure(style="Dark.TFrame")
 
-    _last_sim_t = [-1.0]
+    _last_sim_t  = [-1.0]
+    _graph_alive = [True]
 
     def _update_graph():
-        sim_t   = shared[5]
+        if not _graph_alive[0]:
+            return
+
+        sim_t = shared[5]
         if sim_t != _last_sim_t[0]:
             _last_sim_t[0] = sim_t
             _t_buf.append(sim_t)
@@ -1195,6 +1199,7 @@ def run_ui(cmd_queue, shared):
     root.after(500, _update_graph)   # start after half a second
 
     def on_close():
+        _graph_alive[0] = False
         send("stop")
         root.after(150, root.destroy)
     root.protocol("WM_DELETE_WINDOW", on_close)
