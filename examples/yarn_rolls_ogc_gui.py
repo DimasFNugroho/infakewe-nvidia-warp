@@ -63,9 +63,12 @@ DEFAULTS = {
     "roll_b_z":          0.9090909090909092,
     "roll_b_radius":     0.15,
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
-    # Tension sensors
-    "sensor_offset":     5,     # number of REST_LENs from guide surface to sphere centre
-    "sensor_sphere_r":   0.05,  # detection sphere radius (metres)
+    # Tension sensor A (upstream, yellow) — place on Roll-A side of guide
+    "sensor_a_x":  -0.30,  "sensor_a_y":  0.10,  "sensor_a_z":  0.00,
+    "sensor_a_r":   0.05,
+    # Tension sensor B (downstream, green) — place on Roll-B side of guide
+    "sensor_b_x":   0.20,  "sensor_b_y": -0.10,  "sensor_b_z":  0.20,
+    "sensor_b_r":   0.05,
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
@@ -442,31 +445,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             "self_collision":         int(state.get("self_collision", 1)),
         }
 
-    # ── Tension sensor state (sphere-window strategy) ────────────────────────
-    # Two detection spheres are placed along the line from guide centre toward
-    # each roll, just outside the guide contact zone. Any particles inside a
-    # sphere are averaged for that sensor's tension reading.
+    # ── Tension sensor state (independent sphere windows) ────────────────────
+    # Each sensor is a sphere with independently adjustable centre and radius.
+    # All particles inside the sphere contribute to the averaged tension reading.
     _sphere_centers = [np.zeros(3), np.zeros(3)]  # [upstream, downstream]
-
-    def _sensor_sphere_centers():
-        """Sphere centres: guide_centre + dir_to_roll × (cyl_radius + offset_m)."""
-        gc  = np.array([float(state["cyl_x"]),
-                        float(state["cyl_y"]),
-                        float(state["cyl_z"])])
-        ra  = np.array([float(state["roll_a_x"]),
-                        float(state["roll_a_y"]),
-                        float(state["roll_a_z"])])
-        rb  = np.array([float(state["roll_b_x"]),
-                        float(state["roll_b_y"]),
-                        float(state["roll_b_z"])])
-        offset_m = max(1, int(state.get("sensor_offset", 5))) * config.REST_LEN
-        gap      = float(state["cyl_radius"]) + offset_m
-
-        dir_a = ra - gc;  na = np.linalg.norm(dir_a)
-        dir_b = rb - gc;  nb = np.linalg.norm(dir_b)
-        if na > 1e-9: dir_a /= na
-        if nb > 1e-9: dir_b /= nb
-        return gc + dir_a * gap, gc + dir_b * gap
 
     def _tension_from_mask(pp, mask):
         """Average tension (cN) over all particles in boolean mask."""
@@ -500,15 +482,17 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
 
     def _write_shared(pp, sim_t):
         """Compute tension via detection spheres, then Capstan metrics → shared[]."""
-        sc_a, sc_b = _sensor_sphere_centers()
+        sc_a = np.array([float(state["sensor_a_x"]),
+                         float(state["sensor_a_y"]),
+                         float(state["sensor_a_z"])])
+        sc_b = np.array([float(state["sensor_b_x"]),
+                         float(state["sensor_b_y"]),
+                         float(state["sensor_b_z"])])
         _sphere_centers[0] = sc_a
         _sphere_centers[1] = sc_b
 
-        sphere_r = float(state.get("sensor_sphere_r", 0.05))
-        dist_a   = np.linalg.norm(pp - sc_a, axis=1)
-        dist_b   = np.linalg.norm(pp - sc_b, axis=1)
-        mask_a   = dist_a < sphere_r
-        mask_b   = dist_b < sphere_r
+        mask_a = np.linalg.norm(pp - sc_a, axis=1) < float(state["sensor_a_r"])
+        mask_b = np.linalg.norm(pp - sc_b, axis=1) < float(state["sensor_b_r"])
 
         T_a   = _tension_from_mask(pp, mask_a)
         T_b   = _tension_from_mask(pp, mask_b)
@@ -725,14 +709,13 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
 
     # Tension sensor sphere markers: yellow = upstream (A), green = downstream (B)
     # Shown at sphere centre; larger size indicates the detection window.
-    _sc_a0, _sc_b0 = _sensor_sphere_centers()
+    _sc_a0 = np.array([DEFAULTS["sensor_a_x"], DEFAULTS["sensor_a_y"], DEFAULTS["sensor_a_z"]], dtype=np.float32)
+    _sc_b0 = np.array([DEFAULTS["sensor_b_x"], DEFAULTS["sensor_b_y"], DEFAULTS["sensor_b_z"]], dtype=np.float32)
     _sphere_centers[0] = _sc_a0;  _sphere_centers[1] = _sc_b0
     sensor_marker_a = visuals.Markers(parent=view.scene)
     sensor_marker_b = visuals.Markers(parent=view.scene)
-    sensor_marker_a.set_data(np.array([_sc_a0], dtype=np.float32),
-                             face_color=(1.0, 0.9, 0.0, 0.8), size=16, edge_width=0)
-    sensor_marker_b.set_data(np.array([_sc_b0], dtype=np.float32),
-                             face_color=(0.0, 0.9, 0.2, 0.8), size=16, edge_width=0)
+    sensor_marker_a.set_data(_sc_a0[np.newaxis], face_color=(1.0, 0.9, 0.0, 0.8), size=16, edge_width=0)
+    sensor_marker_b.set_data(_sc_b0[np.newaxis], face_color=(0.0, 0.9, 0.2, 0.8), size=16, edge_width=0)
 
     # pos=(10, 60): text renders upward from this anchor in vispy canvas coords,
     # so 3 lines of font_size=10 need ~15px each → land at y≈60, 45, 30 (all visible).
@@ -1006,8 +989,17 @@ def run_ui(cmd_queue, shared):
     )
     add_slider("Self-collision stiffness",   "self_ee_stiff",        0.0, 1.0,  DEFAULTS["self_ee_stiff"])
     add_slider("Redetect threshold (×r)",   "redetect_threshold",   0.05, 2.0, DEFAULTS["redetect_threshold"], fmt="{:.3f}")
-    add_slider("Sensor offset (particles)", "sensor_offset",        1,   30,   DEFAULTS["sensor_offset"],    is_int=True)
-    add_slider("Sensor sphere radius (m)", "sensor_sphere_r",   0.01,  0.5,  DEFAULTS["sensor_sphere_r"],  fmt="{:.3f}")
+    section("Tension sensor A — upstream (yellow)")
+    add_slider("Sensor A  X", "sensor_a_x", -3.0, 3.0, DEFAULTS["sensor_a_x"], fmt="{:+.3f}")
+    add_slider("Sensor A  Y", "sensor_a_y", -3.0, 3.0, DEFAULTS["sensor_a_y"], fmt="{:+.3f}")
+    add_slider("Sensor A  Z", "sensor_a_z", -3.0, 3.0, DEFAULTS["sensor_a_z"], fmt="{:+.3f}")
+    add_slider("Sensor A  radius (m)", "sensor_a_r", 0.01, 0.5, DEFAULTS["sensor_a_r"], fmt="{:.3f}")
+
+    section("Tension sensor B — downstream (green)")
+    add_slider("Sensor B  X", "sensor_b_x", -3.0, 3.0, DEFAULTS["sensor_b_x"], fmt="{:+.3f}")
+    add_slider("Sensor B  Y", "sensor_b_y", -3.0, 3.0, DEFAULTS["sensor_b_y"], fmt="{:+.3f}")
+    add_slider("Sensor B  Z", "sensor_b_z", -3.0, 3.0, DEFAULTS["sensor_b_z"], fmt="{:+.3f}")
+    add_slider("Sensor B  radius (m)", "sensor_b_r", 0.01, 0.5, DEFAULTS["sensor_b_r"], fmt="{:.3f}")
 
     section("Roll A — feeding roll (freely rotating)")
     add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
