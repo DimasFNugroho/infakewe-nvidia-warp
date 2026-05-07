@@ -441,57 +441,79 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             "self_collision":         int(state.get("self_collision", 1)),
         }
 
-    # ── Tension sensor state ─────────────────────────────────────────────────
-    _sensor_idx = [5, 10]   # [upstream_idx, downstream_idx]; updated each frame
+    # ── Tension sensor state (sphere-window strategy) ────────────────────────
+    # Two detection spheres are placed along the line from guide centre toward
+    # each roll, just outside the guide contact zone. Any particles inside a
+    # sphere are averaged for that sensor's tension reading.
+    _sphere_centers = [np.zeros(3), np.zeros(3)]  # [upstream, downstream]
 
-    def _find_sensors(pp):
-        """Return (a_idx, b_idx) bracketing the guide contact midpoint."""
+    def _sensor_sphere_centers():
+        """Sphere centres: guide_centre + dir_to_roll × (cyl_radius + offset_m)."""
+        gc  = np.array([float(state["cyl_x"]),
+                        float(state["cyl_y"]),
+                        float(state["cyl_z"])])
+        ra  = np.array([float(state["roll_a_x"]),
+                        float(state["roll_a_y"]),
+                        float(state["roll_a_z"])])
+        rb  = np.array([float(state["roll_b_x"]),
+                        float(state["roll_b_y"]),
+                        float(state["roll_b_z"])])
+        offset_m = max(1, int(state.get("sensor_offset", 5))) * config.REST_LEN
+        gap      = float(state["cyl_radius"]) + offset_m
+
+        dir_a = ra - gc;  na = np.linalg.norm(dir_a)
+        dir_b = rb - gc;  nb = np.linalg.norm(dir_b)
+        if na > 1e-9: dir_a /= na
+        if nb > 1e-9: dir_b /= nb
+        return gc + dir_a * gap, gc + dir_b * gap
+
+    def _tension_from_mask(pp, mask):
+        """Average tension (cN) over all particles in boolean mask."""
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            return 0.0
+        stiff      = float(state["stretch_stiff"])
+        mass       = float(state["particle_mass"])
+        L0         = config.REST_LEN
+        sub_dt_ref = config.DT / 200.0   # normalise so reading is substep-stable
+        exts = []
+        for i in idxs:
+            if i < N - 1:
+                exts.append(max(0.0, np.linalg.norm(pp[i+1] - pp[i]) - L0))
+            if i > 0:
+                exts.append(max(0.0, np.linalg.norm(pp[i] - pp[i-1]) - L0))
+        if not exts:
+            return 0.0
+        T_N = mass * stiff * float(np.mean(exts)) / (sub_dt_ref ** 2)
+        return T_N * 100.0   # → centi-Newtons
+
+    def _wrap_angle(pp, sc_a, sc_b):
+        """Wrap angle θ (rad) between the two sensor sphere centres around guide."""
         cx = float(state["cyl_x"]);  cz = float(state["cyl_z"])
-        dx = pp[:, 0] - cx;          dz = pp[:, 2] - cz
-        dist_xz = np.sqrt(dx * dx + dz * dz)
-        mid     = int(np.argmin(dist_xz))
-        offset  = max(1, int(state.get("sensor_offset", 5)))
-        a = max(1,   mid - offset)
-        b = min(N-2, mid + offset)
-        return a, b
-
-    def _tension_cN(pp, idx):
-        """Average tension in centi-Newtons at particle index idx (±2 segments)."""
-        sub_dt = config.DT / max(1, config.SUBSTEPS)
-        stiff  = float(state["stretch_stiff"])
-        mass   = float(state["particle_mass"])
-        L0     = config.REST_LEN
-        lo = max(0,   idx - 2)
-        hi = min(N-2, idx + 2)
-        extensions = [max(0.0, np.linalg.norm(pp[k+1] - pp[k]) - L0)
-                      for k in range(lo, hi + 1)]
-        avg_ext = float(np.mean(extensions))
-        # Normalise by (sub_dt_ref / sub_dt)² so reading is stable across
-        # substep counts. sub_dt_ref uses the default 200 substeps.
-        sub_dt_ref = config.DT / 200.0
-        T_N = mass * stiff * avg_ext / (sub_dt_ref ** 2)
-        return T_N * 100.0   # Newtons → centi-Newtons
-
-    def _wrap_angle(pp, a_idx, b_idx):
-        """Wrap angle θ (radians) from guide centre to the two sensor particles."""
-        cx = float(state["cyl_x"]);  cz = float(state["cyl_z"])
-        va = np.array([pp[a_idx, 0] - cx, pp[a_idx, 2] - cz])
-        vb = np.array([pp[b_idx, 0] - cx, pp[b_idx, 2] - cz])
+        va = np.array([sc_a[0] - cx, sc_a[2] - cz])
+        vb = np.array([sc_b[0] - cx, sc_b[2] - cz])
         na = np.linalg.norm(va);  nb = np.linalg.norm(vb)
         if na < 1e-9 or nb < 1e-9:
             return 0.0
-        cos_t = np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0)
-        return float(np.arccos(cos_t))
+        return float(np.arccos(np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0)))
 
     def _write_shared(pp, sim_t):
-        """Compute tension, wrap angle, Capstan metrics and publish to shared[]."""
-        a, b = _find_sensors(pp)
-        _sensor_idx[0] = a;  _sensor_idx[1] = b
-        T_a   = _tension_cN(pp, a)
-        T_b   = _tension_cN(pp, b)
-        theta = _wrap_angle(pp, a, b)
+        """Compute tension via detection spheres, then Capstan metrics → shared[]."""
+        sc_a, sc_b = _sensor_sphere_centers()
+        _sphere_centers[0] = sc_a
+        _sphere_centers[1] = sc_b
+
+        sphere_r = max(1, int(state.get("sensor_offset", 5))) * config.REST_LEN * 1.5
+        dist_a   = np.linalg.norm(pp - sc_a, axis=1)
+        dist_b   = np.linalg.norm(pp - sc_b, axis=1)
+        mask_a   = dist_a < sphere_r
+        mask_b   = dist_b < sphere_r
+
+        T_a   = _tension_from_mask(pp, mask_a)
+        T_b   = _tension_from_mask(pp, mask_b)
+        theta = _wrap_angle(pp, sc_a, sc_b)
         mu_k  = float(state["mu_kinetic"])
-        capstan_pred = T_a * np.exp(mu_k * theta)   # theoretical T_b (cN)
+        capstan_pred = T_a * np.exp(mu_k * theta)
         residual     = (T_b / capstan_pred) if capstan_pred > 1e-9 else 0.0
         # shared layout: [T_a, T_b, theta_deg, capstan_pred, residual, sim_time]
         shared[0] = T_a
@@ -700,13 +722,16 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     marker_a.set_data(p[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
     marker_b.set_data(p[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
-    # Tension sensor markers: yellow = upstream (A), green = downstream (B)
+    # Tension sensor sphere markers: yellow = upstream (A), green = downstream (B)
+    # Shown at sphere centre; larger size indicates the detection window.
+    _sc_a0, _sc_b0 = _sensor_sphere_centers()
+    _sphere_centers[0] = _sc_a0;  _sphere_centers[1] = _sc_b0
     sensor_marker_a = visuals.Markers(parent=view.scene)
     sensor_marker_b = visuals.Markers(parent=view.scene)
-    sensor_marker_a.set_data(p[_sensor_idx[0]:_sensor_idx[0]+1],
-                             face_color=(1.0, 0.9, 0.0, 1.0), size=10, edge_width=0)
-    sensor_marker_b.set_data(p[_sensor_idx[1]:_sensor_idx[1]+1],
-                             face_color=(0.0, 0.9, 0.2, 1.0), size=10, edge_width=0)
+    sensor_marker_a.set_data(np.array([_sc_a0], dtype=np.float32),
+                             face_color=(1.0, 0.9, 0.0, 0.8), size=16, edge_width=0)
+    sensor_marker_b.set_data(np.array([_sc_b0], dtype=np.float32),
+                             face_color=(0.0, 0.9, 0.2, 0.8), size=16, edge_width=0)
 
     # pos=(10, 60): text renders upward from this anchor in vispy canvas coords,
     # so 3 lines of font_size=10 need ~15px each → land at y≈60, 45, 30 (all visible).
@@ -804,11 +829,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         marker_b.set_data(pp[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
         _write_shared(pp, sim_time[0])
-        sa, sb = _sensor_idx[0], _sensor_idx[1]
-        sensor_marker_a.set_data(pp[sa:sa+1], face_color=(1.0, 0.9, 0.0, 1.0),
-                                 size=10, edge_width=0)
-        sensor_marker_b.set_data(pp[sb:sb+1], face_color=(0.0, 0.9, 0.2, 1.0),
-                                 size=10, edge_width=0)
+        sensor_marker_a.set_data(np.array([_sphere_centers[0]], dtype=np.float32),
+                                 face_color=(1.0, 0.9, 0.0, 0.8), size=16, edge_width=0)
+        sensor_marker_b.set_data(np.array([_sphere_centers[1]], dtype=np.float32),
+                                 face_color=(0.0, 0.9, 0.2, 0.8), size=16, edge_width=0)
 
         # Read Roll A state from GPU once per frame (not per substep).
         _omega_a = float(omega_a_wp.numpy()[0])
@@ -1080,8 +1104,7 @@ def run_ui(cmd_queue, shared):
                ).pack(side="left", expand=True, fill="x", padx=2)
     ttk.Button(btn_frm, text="Reset", command=lambda: send("reset")
                ).pack(side="left", expand=True, fill="x", padx=2)
-    ttk.Button(btn_frm, text="Exit",
-               command=lambda: (send("stop"), root.after(150, root.destroy))
+    ttk.Button(btn_frm, text="Exit", command=lambda: on_close()
                ).pack(side="left", expand=True, fill="x", padx=2)
 
     # Auto-load params-main.json at startup so all saved preferences
@@ -1228,3 +1251,6 @@ if __name__ == "__main__":
         worker.join(timeout=5.0)
         if worker.is_alive():
             worker.terminate()
+            worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.kill()   # SIGKILL — last resort if CUDA blocks SIGTERM
