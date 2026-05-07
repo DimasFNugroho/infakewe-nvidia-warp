@@ -708,24 +708,31 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     marker_b.set_data(p[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
     # Tension sensor spheres: proper 3D meshes that scale with the scene.
-    # A unit sphere is generated once; STRTransform positions and scales it
-    # to match the sensor centre and radius every frame.
+    # Unit sphere vertices are generated once; each frame we scale+translate
+    # them in numpy — no vispy transform API required, works across versions.
     from vispy.geometry import create_sphere
-    from vispy.visuals.transforms import STRTransform
 
     _sc_a0 = np.array([DEFAULTS["sensor_a_x"], DEFAULTS["sensor_a_y"], DEFAULTS["sensor_a_z"]], dtype=np.float32)
     _sc_b0 = np.array([DEFAULTS["sensor_b_x"], DEFAULTS["sensor_b_y"], DEFAULTS["sensor_b_z"]], dtype=np.float32)
     _sphere_centers[0] = _sc_a0;  _sphere_centers[1] = _sc_b0
 
-    _unit_sphere = create_sphere(radius=1.0, cols=24, rows=24)
-    sensor_sphere_a = visuals.Mesh(meshdata=_unit_sphere,
-                                   color=(1.0, 0.85, 0.0, 0.22),
-                                   shading="smooth", parent=view.scene)
-    sensor_sphere_b = visuals.Mesh(meshdata=_unit_sphere,
-                                   color=(0.0, 0.85, 0.25, 0.22),
-                                   shading="smooth", parent=view.scene)
-    # Small opaque centre dots so the centre is visible even when looking
-    # through the transparent mesh from any angle.
+    _sphere_md    = create_sphere(radius=1.0, cols=24, rows=24)
+    _unit_verts   = _sphere_md.get_vertices()          # (V, 3) unit sphere
+    _sphere_faces = _sphere_md.get_faces()             # (F, 3) indices, shared
+
+    def _sphere_verts(center, radius):
+        return (_unit_verts * radius + center).astype(np.float32)
+
+    sensor_sphere_a = visuals.Mesh(
+        vertices=_sphere_verts(_sc_a0, DEFAULTS["sensor_a_r"]),
+        faces=_sphere_faces,
+        color=(1.0, 0.85, 0.0, 0.22), shading="smooth", parent=view.scene)
+    sensor_sphere_b = visuals.Mesh(
+        vertices=_sphere_verts(_sc_b0, DEFAULTS["sensor_b_r"]),
+        faces=_sphere_faces,
+        color=(0.0, 0.85, 0.25, 0.22), shading="smooth", parent=view.scene)
+
+    # Small opaque centre dots — visible through the transparent mesh.
     sensor_dot_a = visuals.Markers(parent=view.scene)
     sensor_dot_b = visuals.Markers(parent=view.scene)
     sensor_dot_a.set_data(_sc_a0[np.newaxis], face_color=(1.0, 0.9, 0.0, 1.0), size=7, edge_width=0)
@@ -734,8 +741,8 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     def _update_sensor_visuals():
         sa = _sphere_centers[0];  ra = float(state.get("sensor_a_r", 0.05))
         sb = _sphere_centers[1];  rb = float(state.get("sensor_b_r", 0.05))
-        sensor_sphere_a.transform = STRTransform(scale=(ra, ra, ra), translate=tuple(float(v) for v in sa))
-        sensor_sphere_b.transform = STRTransform(scale=(rb, rb, rb), translate=tuple(float(v) for v in sb))
+        sensor_sphere_a.set_data(vertices=_sphere_verts(sa, ra), faces=_sphere_faces)
+        sensor_sphere_b.set_data(vertices=_sphere_verts(sb, rb), faces=_sphere_faces)
         sensor_dot_a.set_data(np.array([sa], dtype=np.float32),
                               face_color=(1.0, 0.9, 0.0, 1.0), size=7, edge_width=0)
         sensor_dot_b.set_data(np.array([sb], dtype=np.float32),
