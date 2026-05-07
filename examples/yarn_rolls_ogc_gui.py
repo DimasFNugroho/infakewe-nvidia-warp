@@ -64,7 +64,8 @@ DEFAULTS = {
     "roll_b_radius":     0.15,
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
     # Tension sensors
-    "sensor_offset":     5,     # particles away from guide contact midpoint on each side
+    "sensor_offset":     5,     # number of REST_LENs from guide surface to sphere centre
+    "sensor_sphere_r":   0.05,  # detection sphere radius (metres)
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
@@ -503,7 +504,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         _sphere_centers[0] = sc_a
         _sphere_centers[1] = sc_b
 
-        sphere_r = max(1, int(state.get("sensor_offset", 5))) * config.REST_LEN * 1.5
+        sphere_r = float(state.get("sensor_sphere_r", 0.05))
         dist_a   = np.linalg.norm(pp - sc_a, axis=1)
         dist_b   = np.linalg.norm(pp - sc_b, axis=1)
         mask_a   = dist_a < sphere_r
@@ -1005,7 +1006,8 @@ def run_ui(cmd_queue, shared):
     )
     add_slider("Self-collision stiffness",   "self_ee_stiff",        0.0, 1.0,  DEFAULTS["self_ee_stiff"])
     add_slider("Redetect threshold (×r)",   "redetect_threshold",   0.05, 2.0, DEFAULTS["redetect_threshold"], fmt="{:.3f}")
-    add_slider("Sensor offset (particles)", "sensor_offset",        1,   30,   DEFAULTS["sensor_offset"], is_int=True)
+    add_slider("Sensor offset (particles)", "sensor_offset",        1,   30,   DEFAULTS["sensor_offset"],    is_int=True)
+    add_slider("Sensor sphere radius (m)", "sensor_sphere_r",   0.01,  0.5,  DEFAULTS["sensor_sphere_r"],  fmt="{:.3f}")
 
     section("Roll A — feeding roll (freely rotating)")
     add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
@@ -1224,10 +1226,12 @@ def run_ui(cmd_queue, shared):
     def on_close():
         _graph_alive[0] = False
         send("stop")
-        root.after(150, root.destroy)
-    root.protocol("WM_DELETE_WINDOW", on_close)
+        plt.close(fig)          # release matplotlib Tk callbacks before destroy
+        root.quit()             # exits mainloop(); __main__ finally block cleans up
 
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
+    root.destroy()              # safe to destroy now that mainloop has returned
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

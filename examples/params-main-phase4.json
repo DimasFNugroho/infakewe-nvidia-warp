@@ -34,5 +34,6 @@
   "cyl_z": -0.03111111111111109,
   "cyl_radius": 0.08,
   "heatmap_mode": 1,
-  "sensor_offset": 5
+  "sensor_offset": 5,
+  "sensor_sphere_r": 0.05
 }
