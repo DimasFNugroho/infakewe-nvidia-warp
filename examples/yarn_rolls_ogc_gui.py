@@ -707,15 +707,41 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     marker_a.set_data(p[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
     marker_b.set_data(p[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
-    # Tension sensor sphere markers: yellow = upstream (A), green = downstream (B)
-    # Shown at sphere centre; larger size indicates the detection window.
+    # Tension sensor spheres: proper 3D meshes that scale with the scene.
+    # A unit sphere is generated once; STRTransform positions and scales it
+    # to match the sensor centre and radius every frame.
+    from vispy.geometry import create_sphere
+    from vispy.visuals.transforms import STRTransform
+
     _sc_a0 = np.array([DEFAULTS["sensor_a_x"], DEFAULTS["sensor_a_y"], DEFAULTS["sensor_a_z"]], dtype=np.float32)
     _sc_b0 = np.array([DEFAULTS["sensor_b_x"], DEFAULTS["sensor_b_y"], DEFAULTS["sensor_b_z"]], dtype=np.float32)
     _sphere_centers[0] = _sc_a0;  _sphere_centers[1] = _sc_b0
-    sensor_marker_a = visuals.Markers(parent=view.scene)
-    sensor_marker_b = visuals.Markers(parent=view.scene)
-    sensor_marker_a.set_data(_sc_a0[np.newaxis], face_color=(1.0, 0.9, 0.0, 0.8), size=16, edge_width=0)
-    sensor_marker_b.set_data(_sc_b0[np.newaxis], face_color=(0.0, 0.9, 0.2, 0.8), size=16, edge_width=0)
+
+    _unit_sphere = create_sphere(radius=1.0, cols=24, rows=24)
+    sensor_sphere_a = visuals.Mesh(meshdata=_unit_sphere,
+                                   color=(1.0, 0.85, 0.0, 0.22),
+                                   shading="smooth", parent=view.scene)
+    sensor_sphere_b = visuals.Mesh(meshdata=_unit_sphere,
+                                   color=(0.0, 0.85, 0.25, 0.22),
+                                   shading="smooth", parent=view.scene)
+    # Small opaque centre dots so the centre is visible even when looking
+    # through the transparent mesh from any angle.
+    sensor_dot_a = visuals.Markers(parent=view.scene)
+    sensor_dot_b = visuals.Markers(parent=view.scene)
+    sensor_dot_a.set_data(_sc_a0[np.newaxis], face_color=(1.0, 0.9, 0.0, 1.0), size=7, edge_width=0)
+    sensor_dot_b.set_data(_sc_b0[np.newaxis], face_color=(0.0, 0.9, 0.3, 1.0), size=7, edge_width=0)
+
+    def _update_sensor_visuals():
+        sa = _sphere_centers[0];  ra = float(state.get("sensor_a_r", 0.05))
+        sb = _sphere_centers[1];  rb = float(state.get("sensor_b_r", 0.05))
+        sensor_sphere_a.transform = STRTransform(scale=(ra, ra, ra), translate=tuple(float(v) for v in sa))
+        sensor_sphere_b.transform = STRTransform(scale=(rb, rb, rb), translate=tuple(float(v) for v in sb))
+        sensor_dot_a.set_data(np.array([sa], dtype=np.float32),
+                              face_color=(1.0, 0.9, 0.0, 1.0), size=7, edge_width=0)
+        sensor_dot_b.set_data(np.array([sb], dtype=np.float32),
+                              face_color=(0.0, 0.9, 0.3, 1.0), size=7, edge_width=0)
+
+    _update_sensor_visuals()
 
     # pos=(10, 60): text renders upward from this anchor in vispy canvas coords,
     # so 3 lines of font_size=10 need ~15px each → land at y≈60, 45, 30 (all visible).
@@ -813,10 +839,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         marker_b.set_data(pp[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
         _write_shared(pp, sim_time[0])
-        sensor_marker_a.set_data(np.array([_sphere_centers[0]], dtype=np.float32),
-                                 face_color=(1.0, 0.9, 0.0, 0.8), size=16, edge_width=0)
-        sensor_marker_b.set_data(np.array([_sphere_centers[1]], dtype=np.float32),
-                                 face_color=(0.0, 0.9, 0.2, 0.8), size=16, edge_width=0)
+        _update_sensor_visuals()
 
         # Read Roll A state from GPU once per frame (not per substep).
         _omega_a = float(omega_a_wp.numpy()[0])
