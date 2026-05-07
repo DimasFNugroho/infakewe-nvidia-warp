@@ -194,13 +194,15 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         bx, by = state["roll_b_x"], state["roll_b_y"]
         return float(np.arctan2(ay - by, ax - bx))
 
-    def make_initial_positions() -> np.ndarray:
+    def make_initial_positions() -> tuple:
         """Helical winding on Roll A, then a nearly-taut free span to Roll B.
 
         n_free is computed from the straight-line gap distance so that free-span
         particles start at roughly REST_LEN spacing (taut).  All remaining
         particles go to the wound section, giving more wraps and a denser
         winding appearance.
+
+        Returns (positions_array, n_wound) so callers can track the wound count.
         """
         ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
         bx, by, bz = state["roll_b_x"], state["roll_b_y"], state["roll_b_z"]
@@ -234,7 +236,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             t = i / n_free
             positions.append(list(p_dep + t * (p_end - p_dep)))
 
-        return np.array(positions[:N], dtype=np.float32)
+        return np.array(positions[:N], dtype=np.float32), n_wound
 
     def make_inv_mass() -> np.ndarray:
         m = max(float(state["particle_mass"]), 1e-6)
@@ -265,7 +267,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     obs_mid = ObstacleGPU(mesh_mid, device)
 
     # ── Yarn GPU arrays ───────────────────────────────────────────────────────
-    pos_np = make_initial_positions()
+    pos_np, n_wound = make_initial_positions()
 
     # Roll rotational state on GPU — updated each substep by their respective kernels.
     angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
@@ -305,7 +307,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     # next call — no changes required in _execute_substeps or sim_reset.
 
     def do_reinit(new_N: int):
-        nonlocal N, n_even, n_odd, n_bend
+        nonlocal N, n_even, n_odd, n_bend, n_wound
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
@@ -324,7 +326,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         omega_a_wp = wp.array([0.0],        dtype=float, device=device)
         angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
 
-        pos_np      = make_initial_positions()
+        pos_np, n_wound = make_initial_positions()
         pos_wp      = wp.array(pos_np,                               dtype=wp.vec3, device=device)
         vel_wp      = wp.array(np.zeros((N, 3), dtype=np.float32),   dtype=wp.vec3, device=device)
         prev_pos_wp = wp.array(pos_np.copy(),                        dtype=wp.vec3, device=device)
@@ -375,13 +377,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     apply_state()
 
     def sim_reset():
+        nonlocal n_wound
         angle_b[0] = init_angle_b()
         angle_a[0] = init_angle_a()
         omega_a[0] = 0.0
         angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
         omega_a_wp.assign(wp.array([0.0],        dtype=float, device=device))
         angle_b_wp.assign(wp.array([angle_b[0]], dtype=float, device=device))
-        pos0 = make_initial_positions()
+        pos0, n_wound = make_initial_positions()
         pos_wp.assign(wp.array(pos0,                              dtype=wp.vec3, device=device))
         prev_pos_wp.assign(wp.array(pos0.copy(),                  dtype=wp.vec3, device=device))
         vel_wp.assign(wp.array(np.zeros((N, 3), dtype=np.float32), dtype=wp.vec3, device=device))
@@ -475,7 +478,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
             if self_coll_on:
-                detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device)
+                detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device,
+                               n_wound=n_wound)
             for _k in range(config.CONSTRAINT_ITER):
                 wp.launch(kernel_stretch_even, dim=n_even, device=device,
                           inputs=[pos_wp, inv_mass_wp, config.REST_LEN, config.STRETCH_STIFF])
@@ -489,7 +493,17 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                 if self_coll_on:
                     project_self_ee(pos_wp, inv_mass_wp, yarn_edges_wp,
                                     self_ee, r, self_ee_stiff, device)
-            for obs, vf, ee in contacts:
+            # Roll A (contacts[0]): friction only on free-span particles — wound
+            # particles follow the roll kinematically and must not be locked by
+            # surface friction or the Capstan strain gradient is destroyed.
+            obs_a_entry, vf_a_cur, ee_a_cur = contacts[0]
+            apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              vf_a_cur, r, mu_s, mu_k, device,
+                              min_idx=n_wound)
+            apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              yarn_edges_wp, ee_a_cur, r, mu_s, mu_k, device,
+                              min_idx=max(0, n_wound - 1))
+            for obs, vf, ee in contacts[1:]:
                 apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   vf, r, mu_s, mu_k, device)
                 apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,

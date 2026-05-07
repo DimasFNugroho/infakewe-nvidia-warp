@@ -125,6 +125,7 @@ def kernel_vf_friction(
     r:         float,
     mu_s:      float,
     mu_k:      float,
+    min_idx:   int,
 ):
     """Position-based Coulomb friction (Müller et al. 2007, Sec. 3.3).
 
@@ -141,6 +142,8 @@ def kernel_vf_friction(
     cone and μ values remain visually significant across the full slider range.
     """
     i = wp.tid()
+    if i < min_idx:
+        return
     if inv_mass[i] == 0.0:
         return
     if vf_active[i] == 0:
@@ -187,6 +190,7 @@ def kernel_ee_friction(
     r:          float,
     mu_s:       float,
     mu_k:       float,
+    min_idx:    int,
 ):
     """Coulomb friction for edge-edge contacts (same cone rule as VF, per-edge).
 
@@ -196,6 +200,8 @@ def kernel_ee_friction(
     barycentric weights used in kernel_ee_project.
     """
     i = wp.tid()
+    if i < min_idx:
+        return
     if (i & 1) != parity:
         return
     if ee_active[i] == 0:
@@ -367,12 +373,13 @@ def apply_vf_friction(
     mu_s:     float,
     mu_k:     float,
     device:   str,
+    min_idx:  int = 0,
 ):
     wp.launch(
         kernel_vf_friction, dim=pos.shape[0], device=device,
         inputs=[pos, prev_pos, inv_mass,
                 vf.active, vf.dist, vf.normal,
-                r, mu_s, mu_k],
+                r, mu_s, mu_k, int(min_idx)],
     )
 
 
@@ -386,6 +393,7 @@ def apply_ee_friction(
     mu_s:       float,
     mu_k:       float,
     device:     str,
+    min_idx:    int = 0,
 ):
     n = yarn_edges.shape[0]
     for parity in (0, 1):
@@ -393,7 +401,7 @@ def apply_ee_friction(
             kernel_ee_friction, dim=n, device=device,
             inputs=[pos, prev_pos, inv_mass, yarn_edges, parity,
                     ee.active, ee.dist, ee.normal, ee.s,
-                    r, mu_s, mu_k],
+                    r, mu_s, mu_k, int(min_idx)],
         )
 
 

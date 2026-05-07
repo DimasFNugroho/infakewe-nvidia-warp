@@ -4,6 +4,11 @@ For every yarn edge i, find the closest other yarn edge j (|i − j| > skip_adj)
 within contact radius r.  Stores at most one contact per yarn edge (the closest
 one) in SelfEEContacts.
 
+Wound-section skip: pairs where both i and j are fully within the wound region
+(both < n_wound - 1) are skipped.  Adjacent wound wraps are always at contact
+distance by design and would create persistent projection forces that corrupt
+the strain field.  Free-span vs. wound contacts are still detected.
+
 Output arrays indexed by yarn edge i (0 .. N-2):
     active[i]    0/1
     cp_self[i]   closest point on edge i
@@ -26,6 +31,7 @@ def kernel_self_ee_detect(
     yarn_edges: wp.array(dtype=wp.vec2i),
     r:          float,
     skip_adj:   int,
+    n_wound:    int,
     # outputs:
     active:     wp.array(dtype=int),
     cp_self:    wp.array(dtype=wp.vec3),
@@ -46,8 +52,14 @@ def kernel_self_ee_detect(
     best_s      = float(0.5)
     found       = int(0)
 
+    n_wound_edge = n_wound - 1   # last fully-wound edge index (exclusive)
+
     n_edges = yarn_edges.shape[0]
     for j in range(n_edges):
+        # Skip pairs where both edges are entirely within the wound section.
+        if i < n_wound_edge and j < n_wound_edge:
+            continue
+
         diff = i - j
         if diff < 0:
             diff = -diff
@@ -75,12 +87,12 @@ def kernel_self_ee_detect(
         best_s      = s
         found       = int(1)
 
-    active[i]    = found
-    cp_self[i]   = best_cp1
-    cp_other[i]  = best_cp2
-    dist_out[i]  = best_dist
+    active[i]     = found
+    cp_self[i]    = best_cp1
+    cp_other[i]   = best_cp2
+    dist_out[i]   = best_dist
     normal_out[i] = best_normal
-    s_out[i]     = best_s
+    s_out[i]      = best_s
 
 
 class SelfEEContacts:
@@ -101,15 +113,20 @@ def detect_self_ee(
     contacts:   SelfEEContacts,
     r:          float,
     device:     str,
+    n_wound:    int = 0,
     skip_adj:   int = 2,
 ):
-    """Run self-EE detection: fill `contacts` with the closest self-contact per yarn edge."""
+    """Run self-EE detection: fill `contacts` with the closest self-contact per yarn edge.
+
+    n_wound: number of wound particles — wound-vs-wound edge pairs are skipped
+             to avoid persistent contacts in the helically packed wound section.
+    """
     wp.launch(
         kernel_self_ee_detect,
         dim=yarn_edges.shape[0],
         device=device,
         inputs=[
-            pos, yarn_edges, float(r), int(skip_adj),
+            pos, yarn_edges, float(r), int(skip_adj), int(n_wound),
             contacts.active, contacts.cp_self, contacts.cp_other,
             contacts.dist, contacts.normal, contacts.s,
         ],
