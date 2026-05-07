@@ -1158,12 +1158,16 @@ def run_ui(cmd_queue, shared):
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-    _GRAPH_HISTORY = 60      # seconds of rolling history to show
+    _GRAPH_HISTORY = 15      # seconds of rolling history to show
     _GRAPH_HZ      = 20      # update rate (Hz)
     _BUF_LEN       = _GRAPH_HISTORY * _GRAPH_HZ * 4   # ample buffer
-    _t_buf  = collections.deque(maxlen=_BUF_LEN)
-    _Ta_buf = collections.deque(maxlen=_BUF_LEN)
-    _Tb_buf = collections.deque(maxlen=_BUF_LEN)
+
+    def _make_bufs():
+        return (collections.deque(maxlen=_BUF_LEN),
+                collections.deque(maxlen=_BUF_LEN),
+                collections.deque(maxlen=_BUF_LEN))
+
+    _t_buf, _Ta_buf, _Tb_buf = _make_bufs()
 
     graph_win = tk.Toplevel(root)
     graph_win.title("Tension sensors — Capstan analysis")
@@ -1201,11 +1205,19 @@ def run_ui(cmd_queue, shared):
     _last_sim_t  = [-1.0]
     _graph_alive = [True]
 
+    def _clear_bufs():
+        _t_buf.clear();  _Ta_buf.clear();  _Tb_buf.clear()
+        line_a.set_data([], []);  line_b.set_data([], [])
+        graph_canvas.draw_idle()
+
     def _update_graph():
         if not _graph_alive[0]:
             return
 
         sim_t = shared[5]
+        # Detect reset: sim_time jumped back (worker reset to 0).
+        if sim_t < _last_sim_t[0] - 0.1:
+            _clear_bufs()
         if sim_t != _last_sim_t[0]:
             _last_sim_t[0] = sim_t
             _t_buf.append(sim_t)
