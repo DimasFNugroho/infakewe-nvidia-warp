@@ -205,7 +205,68 @@ at the top of each script.
 
 ---
 
-## 7. Troubleshooting
+## 7. Tension sensing and the Capstan equation
+
+The roll-to-roll simulation (`yarn_rolls_ogc_gui.py`) includes two virtual
+tension sensors placed on either side of the guide cylinder. The upstream
+sensor measures **T_A** (hold-side tension) and the downstream sensor
+measures **T_B** (load-side tension).
+
+### How tension is computed
+
+Tension is derived from the PBD position corrections. For a segment between
+particles `i` and `i+1` with rest length `L₀`:
+
+```
+extension  = |p_{i+1} − p_i| − L₀
+T  (N)     = particle_mass × stretch_stiff × extension / sub_dt²
+T  (cN)    = T × 100
+```
+
+This follows from the PBD impulse equivalence: the per-substep position
+correction `Δx = stiff × extension` is equivalent to a spring impulse
+`F·Δt = m·Δx`, giving `F = m·stiff·extension / Δt²`. The result is
+averaged over a small window of segments around the sensor particle to
+suppress noise.
+
+### Capstan equation validation
+
+The Capstan equation for a yarn sliding over a cylinder under kinetic
+friction is:
+
+```
+T_B / T_A = e^(μ_k · θ)
+```
+
+where `θ` is the **wrap angle** — the arc subtended by the yarn contact on
+the guide cylinder (in radians). The simulation computes `θ` every frame
+from the angle between the vectors from the guide centre to each sensor
+particle.
+
+The panel displays:
+- **Measured ratio** `T_B / T_A` — from particle positions
+- **Theoretical ratio** `e^(μ_k · θ)` — Capstan prediction using the
+  simulation's own `μ_k` and the measured `θ`
+- **Residual** `measured / theoretical` — how well the friction model
+  matches the Capstan equation; 1.0 = perfect agreement
+
+### Important limitation
+
+All three quantities (`T_A`, `T_B`, `θ`) are derived from the same PBD
+simulation state. The residual therefore measures **internal consistency**
+— whether the tension ratio the simulation produces matches the Capstan
+amplification factor for the geometry it produces. It is *not* a
+ground-truth validation against physical measurements.
+
+Additionally, the absolute cN values depend on the `particle_mass`,
+`stretch_stiff`, and `substeps` settings. If any of these change, the
+scale of the readings changes accordingly. The readings are most meaningful
+when compared *relative to each other* (i.e., the ratio and residual)
+rather than as absolute forces.
+
+---
+
+## 8. Troubleshooting
 
 - **`CUDA available: False`** — Warp falls back to CPU automatically. If you
   expected GPU, check that an NVIDIA driver is installed and that

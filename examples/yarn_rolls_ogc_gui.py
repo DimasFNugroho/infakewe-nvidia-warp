@@ -63,6 +63,8 @@ DEFAULTS = {
     "roll_b_z":          0.9090909090909092,
     "roll_b_radius":     0.15,
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
+    # Tension sensors
+    "sensor_offset":     5,     # particles away from guide contact midpoint on each side
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
@@ -79,7 +81,7 @@ DEFAULTS = {
 
 # ── Simulation worker process ─────────────────────────────────────────────────
 
-def sim_worker(cmd_queue, script_dir: str, defaults: dict):
+def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     """Run Warp + OGC (3 obstacles) + vispy in a dedicated process."""
     sys.path.insert(0, os.path.join(script_dir, ".."))
     sys.path.insert(0, script_dir)
@@ -439,6 +441,66 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             "self_collision":         int(state.get("self_collision", 1)),
         }
 
+    # ── Tension sensor state ─────────────────────────────────────────────────
+    _sensor_idx = [5, 10]   # [upstream_idx, downstream_idx]; updated each frame
+
+    def _find_sensors(pp):
+        """Return (a_idx, b_idx) bracketing the guide contact midpoint."""
+        cx = float(state["cyl_x"]);  cz = float(state["cyl_z"])
+        dx = pp[:, 0] - cx;          dz = pp[:, 2] - cz
+        dist_xz = np.sqrt(dx * dx + dz * dz)
+        mid     = int(np.argmin(dist_xz))
+        offset  = max(1, int(state.get("sensor_offset", 5)))
+        a = max(1,   mid - offset)
+        b = min(N-2, mid + offset)
+        return a, b
+
+    def _tension_cN(pp, idx):
+        """Average tension in centi-Newtons at particle index idx (±2 segments)."""
+        sub_dt = config.DT / max(1, config.SUBSTEPS)
+        stiff  = float(state["stretch_stiff"])
+        mass   = float(state["particle_mass"])
+        L0     = config.REST_LEN
+        lo = max(0,   idx - 2)
+        hi = min(N-2, idx + 2)
+        extensions = [max(0.0, np.linalg.norm(pp[k+1] - pp[k]) - L0)
+                      for k in range(lo, hi + 1)]
+        avg_ext = float(np.mean(extensions))
+        # Normalise by (sub_dt_ref / sub_dt)² so reading is stable across
+        # substep counts. sub_dt_ref uses the default 200 substeps.
+        sub_dt_ref = config.DT / 200.0
+        T_N = mass * stiff * avg_ext / (sub_dt_ref ** 2)
+        return T_N * 100.0   # Newtons → centi-Newtons
+
+    def _wrap_angle(pp, a_idx, b_idx):
+        """Wrap angle θ (radians) from guide centre to the two sensor particles."""
+        cx = float(state["cyl_x"]);  cz = float(state["cyl_z"])
+        va = np.array([pp[a_idx, 0] - cx, pp[a_idx, 2] - cz])
+        vb = np.array([pp[b_idx, 0] - cx, pp[b_idx, 2] - cz])
+        na = np.linalg.norm(va);  nb = np.linalg.norm(vb)
+        if na < 1e-9 or nb < 1e-9:
+            return 0.0
+        cos_t = np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0)
+        return float(np.arccos(cos_t))
+
+    def _write_shared(pp, sim_t):
+        """Compute tension, wrap angle, Capstan metrics and publish to shared[]."""
+        a, b = _find_sensors(pp)
+        _sensor_idx[0] = a;  _sensor_idx[1] = b
+        T_a   = _tension_cN(pp, a)
+        T_b   = _tension_cN(pp, b)
+        theta = _wrap_angle(pp, a, b)
+        mu_k  = float(state["mu_kinetic"])
+        capstan_pred = T_a * np.exp(mu_k * theta)   # theoretical T_b (cN)
+        residual     = (T_b / capstan_pred) if capstan_pred > 1e-9 else 0.0
+        # shared layout: [T_a, T_b, theta_deg, capstan_pred, residual, sim_time]
+        shared[0] = T_a
+        shared[1] = T_b
+        shared[2] = float(np.degrees(theta))
+        shared[3] = capstan_pred
+        shared[4] = residual
+        shared[5] = sim_t
+
     def _execute_substeps():
         """One full frame of substeps — graph-capture-safe.
 
@@ -638,6 +700,14 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     marker_a.set_data(p[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
     marker_b.set_data(p[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
+    # Tension sensor markers: yellow = upstream (A), green = downstream (B)
+    sensor_marker_a = visuals.Markers(parent=view.scene)
+    sensor_marker_b = visuals.Markers(parent=view.scene)
+    sensor_marker_a.set_data(p[_sensor_idx[0]:_sensor_idx[0]+1],
+                             face_color=(1.0, 0.9, 0.0, 1.0), size=10, edge_width=0)
+    sensor_marker_b.set_data(p[_sensor_idx[1]:_sensor_idx[1]+1],
+                             face_color=(0.0, 0.9, 0.2, 1.0), size=10, edge_width=0)
+
     # pos=(10, 60): text renders upward from this anchor in vispy canvas coords,
     # so 3 lines of font_size=10 need ~15px each → land at y≈60, 45, 30 (all visible).
     hud = visuals.Text(
@@ -733,6 +803,13 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         marker_a.set_data(pp[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
         marker_b.set_data(pp[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
+        _write_shared(pp, sim_time[0])
+        sa, sb = _sensor_idx[0], _sensor_idx[1]
+        sensor_marker_a.set_data(pp[sa:sa+1], face_color=(1.0, 0.9, 0.0, 1.0),
+                                 size=10, edge_width=0)
+        sensor_marker_b.set_data(pp[sb:sb+1], face_color=(0.0, 0.9, 0.2, 1.0),
+                                 size=10, edge_width=0)
+
         # Read Roll A state from GPU once per frame (not per substep).
         _omega_a = float(omega_a_wp.numpy()[0])
         _angle_a = float(angle_a_wp.numpy()[0])
@@ -744,13 +821,17 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             "-- Parameter changed from UI: simulation running slower until graph rebuilds --"
             if graph_mode == "loop" else ""
         )
+        _T_a   = shared[0];  _T_b  = shared[1]
+        _theta = shared[2];  _pred = shared[3];  _resid = shared[4]
         hud.text = (
             f"N={N}  seg={config.REST_LEN*1000:.1f}mm  r={state['ogc_r']:.3f}  "
             f"substeps={config.SUBSTEPS}  iter={config.CONSTRAINT_ITER}\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
             f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°\n"
             f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
-            f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms"
+            f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
+            f"T_A={_T_a:.2f}cN  T_B={_T_b:.2f}cN  "
+            f"θ={_theta:.1f}°  pred={_pred:.2f}cN  resid={_resid:.3f}"
         )
         canvas.update()
 
@@ -762,7 +843,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
 # ── Tkinter control panel (parent process) ────────────────────────────────────
 
-def run_ui(cmd_queue):
+def run_ui(cmd_queue, shared):
     import json
     import tkinter as tk
     from tkinter import ttk, filedialog
@@ -900,6 +981,7 @@ def run_ui(cmd_queue):
     )
     add_slider("Self-collision stiffness",   "self_ee_stiff",        0.0, 1.0,  DEFAULTS["self_ee_stiff"])
     add_slider("Redetect threshold (×r)",   "redetect_threshold",   0.05, 2.0, DEFAULTS["redetect_threshold"], fmt="{:.3f}")
+    add_slider("Sensor offset (particles)", "sensor_offset",        1,   30,   DEFAULTS["sensor_offset"], is_int=True)
 
     section("Roll A — feeding roll (freely rotating)")
     add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
@@ -1022,6 +1104,96 @@ def run_ui(cmd_queue):
         except Exception as _e:
             print(f"[ui] auto-load failed: {_e}", flush=True)
 
+    # ── Live tension graph window ─────────────────────────────────────────────
+    import collections, math
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    _GRAPH_HISTORY = 60      # seconds of rolling history to show
+    _GRAPH_HZ      = 20      # update rate (Hz)
+    _BUF_LEN       = _GRAPH_HISTORY * _GRAPH_HZ * 4   # ample buffer
+    _t_buf  = collections.deque(maxlen=_BUF_LEN)
+    _Ta_buf = collections.deque(maxlen=_BUF_LEN)
+    _Tb_buf = collections.deque(maxlen=_BUF_LEN)
+
+    graph_win = tk.Toplevel(root)
+    graph_win.title("Tension sensors — Capstan analysis")
+    graph_win.geometry("680x480")
+    graph_win.protocol("WM_DELETE_WINDOW", lambda: None)   # keep alive with main
+
+    fig, ax = plt.subplots(figsize=(6.8, 3.6), dpi=100)
+    fig.patch.set_facecolor("#1e1e1e")
+    ax.set_facecolor("#1e1e1e")
+    ax.tick_params(colors="white");  ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white");  ax.title.set_color("white")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#555555")
+    ax.set_xlabel("Simulation time (s)")
+    ax.set_ylabel("Tension (cN)")
+    ax.set_title("Yarn tension — upstream (A) vs downstream (B)")
+    ax.axhline(0, color="#555555", linewidth=0.8, linestyle="--")
+    line_a, = ax.plot([], [], color="#4da6ff", linewidth=1.5, label="T_A upstream (yellow)")
+    line_b, = ax.plot([], [], color="#ff7f3f", linewidth=1.5, label="T_B downstream (green)")
+    ax.legend(facecolor="#2a2a2a", labelcolor="white", fontsize=8,
+              loc="upper left")
+    fig.tight_layout(rect=[0, 0.0, 1, 1])
+
+    graph_canvas = FigureCanvasTkAgg(fig, master=graph_win)
+    graph_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    # Text panel below the plot for Capstan breakdown
+    info_frm = ttk.Frame(graph_win)
+    info_frm.pack(fill="x", padx=8, pady=4)
+    _info_var = tk.StringVar(value="Waiting for simulation data...")
+    ttk.Label(info_frm, textvariable=_info_var, font=("Courier", 9),
+              foreground="white", background="#1e1e1e").pack(anchor="w")
+    info_frm.configure(style="Dark.TFrame")
+
+    _last_sim_t = [-1.0]
+
+    def _update_graph():
+        sim_t   = shared[5]
+        if sim_t != _last_sim_t[0]:
+            _last_sim_t[0] = sim_t
+            _t_buf.append(sim_t)
+            _Ta_buf.append(shared[0])
+            _Tb_buf.append(shared[1])
+
+        if len(_t_buf) >= 2:
+            t_arr  = list(_t_buf)
+            ta_arr = list(_Ta_buf)
+            tb_arr = list(_Tb_buf)
+            t_now  = t_arr[-1]
+            t_lo   = t_now - _GRAPH_HISTORY
+
+            line_a.set_data(t_arr, ta_arr)
+            line_b.set_data(t_arr, tb_arr)
+            ax.set_xlim(max(0.0, t_lo), max(t_now, _GRAPH_HISTORY))
+            all_vals = ta_arr + tb_arr
+            v_min = min(all_vals);  v_max = max(all_vals)
+            pad   = max(0.5, (v_max - v_min) * 0.15)
+            ax.set_ylim(v_min - pad, v_max + pad)
+            graph_canvas.draw_idle()
+
+        T_a    = shared[0];  T_b   = shared[1]
+        theta  = shared[2];  pred  = shared[3];  resid = shared[4]
+        mu_k   = float(param_vars.get("mu_kinetic", tk.DoubleVar(value=0.0)).get())
+        theta_r = math.radians(theta)
+        _info_var.set(
+            f"T_A = {T_a:7.3f} cN  (upstream,  yellow)      "
+            f"T_B = {T_b:7.3f} cN  (downstream, green)\n"
+            f"Wrap angle θ = {theta:.1f}°    μ_k = {mu_k:.4f}    "
+            f"e^(μ_k·θ) = {math.exp(mu_k * theta_r):.4f}\n"
+            f"Measured ratio T_B/T_A = {(T_b/T_a if T_a > 1e-6 else 0):.4f}    "
+            f"Capstan pred T_B = {pred:.3f} cN    Residual = {resid:.4f}"
+        )
+
+        root.after(1000 // _GRAPH_HZ, _update_graph)
+
+    root.after(500, _update_graph)   # start after half a second
+
     def on_close():
         send("stop")
         root.after(150, root.destroy)
@@ -1035,14 +1207,17 @@ def run_ui(cmd_queue):
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
+    # Shared memory: [T_a(cN), T_b(cN), theta_deg, capstan_pred(cN), residual, sim_time]
+    shared = mp.Array('d', 6)
+
     cmd_queue = mp.Queue()
     worker = mp.Process(
-        target=sim_worker, args=(cmd_queue, _SCRIPT_DIR, DEFAULTS),
+        target=sim_worker, args=(cmd_queue, shared, _SCRIPT_DIR, DEFAULTS),
     )
     worker.start()
 
     try:
-        run_ui(cmd_queue)
+        run_ui(cmd_queue, shared)
     finally:
         cmd_queue.put(("stop",))
         worker.join(timeout=5.0)

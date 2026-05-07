@@ -33,5 +33,6 @@
   "cyl_y": -0.4,
   "cyl_z": 0.0,
   "cyl_radius": 0.08,
-  "redetect_threshold": 0.3
+  "redetect_threshold": 0.3,
+  "sensor_offset": 5
 }

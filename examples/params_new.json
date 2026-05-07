@@ -33,5 +33,6 @@
   "cyl_radius": 0.08,
   "self_collision": 1,
   "heatmap_mode": 0,
-  "redetect_threshold": 0.3
+  "redetect_threshold": 0.3,
+  "sensor_offset": 5
 }
