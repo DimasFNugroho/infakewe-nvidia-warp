@@ -923,6 +923,13 @@ def run_ui(cmd_queue):
             if key in param_vars and key in param_callbacks:
                 param_vars[key].set(value)
                 param_callbacks[key](value)
+        # Apply DEFAULTS for any key missing from the file so that old param
+        # files (saved before new sliders/toggles were added) still produce a
+        # fully-defined state rather than silently leaving stale values.
+        for key, default_val in DEFAULTS.items():
+            if key not in data and key in param_vars and key in param_callbacks:
+                param_vars[key].set(default_val)
+                param_callbacks[key](default_val)
         _update_n_label()
         print(f"[ui] loaded parameters from {path}", flush=True)
 
@@ -963,6 +970,12 @@ def run_ui(cmd_queue):
     ttk.Button(btn_frm, text="Exit",
                command=lambda: (send("stop"), root.after(150, root.destroy))
                ).pack(side="left", expand=True, fill="x", padx=2)
+
+    # Explicitly sync toggle states to the sim at startup so the sim process
+    # receives the correct initial values even before the user touches anything.
+    for _key in ("self_collision", "heatmap_mode"):
+        if _key in param_callbacks:
+            param_callbacks[_key](param_vars[_key].get())
 
     def on_close():
         send("stop")
