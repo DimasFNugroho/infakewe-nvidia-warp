@@ -32,5 +32,6 @@
   "cyl_y": -0.32444444444444454,
   "cyl_z": -0.03111111111111109,
   "cyl_radius": 0.08,
-  "heatmap_mode": 1
+  "heatmap_mode": 1,
+  "redetect_threshold": 0.3
 }

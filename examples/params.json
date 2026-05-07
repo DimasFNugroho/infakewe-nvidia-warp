@@ -32,5 +32,6 @@
   "cyl_x": 0.0,
   "cyl_y": -0.4,
   "cyl_z": 0.0,
-  "cyl_radius": 0.08
+  "cyl_radius": 0.08,
+  "redetect_threshold": 0.3
 }

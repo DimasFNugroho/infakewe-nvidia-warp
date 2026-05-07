@@ -32,5 +32,6 @@
   "cyl_z": 0.0,
   "cyl_radius": 0.08,
   "self_collision": 1,
-  "heatmap_mode": 0
+  "heatmap_mode": 0,
+  "redetect_threshold": 0.3
 }

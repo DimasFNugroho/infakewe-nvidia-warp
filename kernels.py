@@ -7,6 +7,8 @@ kernel_stretch_even       Stretch constraints for even-index pairs (0,1),(2,3),.
 kernel_stretch_odd        Stretch constraints for odd-index  pairs (1,2),(3,4),...
 kernel_bend               Bending resistance via skip-one distance constraints
 kernel_update_velocity    PBD velocity correction from position delta
+kernel_reset_scalar       Zero a single-element float array (for redetection flag)
+kernel_max_disp_sq        Atomic-max squared displacement (conservative-bound check)
 
 Even/odd splitting for stretch ensures no two threads write to the same
 particle, making those passes fully conflict-free on GPU.
@@ -132,3 +134,24 @@ def kernel_update_velocity(
     if inv_mass[i] == 0.0:
         return
     vel[i] = (pos[i] - prev_pos[i]) * inv_dt
+
+
+@wp.kernel
+def kernel_reset_scalar(buf: wp.array(dtype=float)):
+    """Zero a single-element array — used to reset the displacement accumulator."""
+    buf[0] = float(0.0)
+
+
+@wp.kernel
+def kernel_max_disp_sq(
+    pos:     wp.array(dtype=wp.vec3),
+    pos_det: wp.array(dtype=wp.vec3),
+    result:  wp.array(dtype=float),
+):
+    """Accumulate the maximum squared displacement since the last detection pass.
+
+    result[0] is updated atomically; caller must zero it before launching.
+    """
+    i  = wp.tid()
+    d2 = wp.length_sq(pos[i] - pos_det[i])
+    wp.atomic_max(result, 0, d2)

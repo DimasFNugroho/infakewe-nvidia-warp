@@ -65,6 +65,7 @@ DEFAULTS = {
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
+    "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
     # Visualisation
     "heatmap_mode":      0,     # 0 = stripe colours, 1 = stretch heatmap
     "heatmap_max_strain": 0.1099622030237581,
@@ -111,7 +112,8 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     from ogc.algorithm6 import project_self_ee, apply_self_ee_friction
     from kernels import (kernel_integrate,
                          kernel_stretch_even, kernel_stretch_odd,
-                         kernel_bend, kernel_update_velocity)
+                         kernel_bend, kernel_update_velocity,
+                         kernel_reset_scalar, kernel_max_disp_sq)
 
     # ── Scene / rendering constants ───────────────────────────────────────────
     CYL_HALF_H = 1.5
@@ -294,6 +296,11 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
     # Self-collision contact array (yarn vs. yarn).
     self_ee = SelfEEContacts(N - 1, device)
 
+    # ── Conservative-bound redetection buffers (Phase 4) ─────────────────────
+    pos_det_wp  = wp.zeros(N, dtype=wp.vec3, device=device)  # positions at last detection
+    max_disp_buf = wp.zeros(1, dtype=float,   device=device)  # scalar accumulator
+    _force_redetect = [True]   # True → skip threshold check, always detect
+
     # List-of-lists so individual obstacles can be hot-swapped.
     contacts = [
         [obs_a,   vf_a,   ee_a],
@@ -311,7 +318,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
-        nonlocal yarn_colors
+        nonlocal yarn_colors, pos_det_wp, max_disp_buf
 
         N = max(4, new_N)
         config.NUM_PARTICLES = N
@@ -346,6 +353,10 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             [contacts[1][0], vf_b,   ee_b],
             [contacts[2][0], vf_mid, ee_mid],
         ]
+
+        pos_det_wp   = wp.zeros(N, dtype=wp.vec3, device=device)
+        max_disp_buf = wp.zeros(1, dtype=float,   device=device)
+        _force_redetect[0] = True
 
         yarn_colors = make_yarn_colors(N)
         _graph[0]   = None
@@ -391,6 +402,7 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
         inv_mass_wp.assign(wp.array(make_inv_mass(),               dtype=float,   device=device))
         sim_time[0] = 0.0
         frame[0]    = 0
+        _force_redetect[0] = True
 
     # ── Shared substep body ───────────────────────────────────────────────────
     # Called both during CUDA graph capture (records launches without executing)
@@ -474,12 +486,6 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
             wp.launch(kernel_integrate, dim=N, device=device,
                       inputs=[pos_wp, vel_wp, prev_pos_wp, inv_mass_wp,
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
-            for obs, vf, ee in contacts:
-                detect_vertex_facet(pos_wp, obs, vf, r, device)
-                detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
-            if self_coll_on:
-                detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device,
-                               n_wound=n_wound)
             for _k in range(config.CONSTRAINT_ITER):
                 wp.launch(kernel_stretch_even, dim=n_even, device=device,
                           inputs=[pos_wp, inv_mass_wp, config.REST_LEN, config.STRETCH_STIFF])
@@ -517,6 +523,18 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
                 damp_normal_velocity(vel_wp, inv_mass_wp, vf, r, device)
             clamp_velocity(vel_wp, v_max, device)
 
+    def _detect_contacts():
+        """Run all contact detection and snapshot pos_det for conservative-bound tracking."""
+        r = float(state["ogc_r"])
+        self_coll = bool(int(state.get("self_collision", 1)))
+        for obs, vf, ee in contacts:
+            detect_vertex_facet(pos_wp, obs, vf, r, device)
+            detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
+        if self_coll:
+            detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device, n_wound=n_wound)
+        wp.copy(pos_det_wp, pos_wp)
+        _force_redetect[0] = False
+
     def _rebuild_graph():
         """(Re)capture the substep loop as a CUDA graph.
 
@@ -537,6 +555,24 @@ def sim_worker(cmd_queue, script_dir: str, defaults: dict):
 
     def sim_step():
         t0 = time.perf_counter()
+
+        # ── Conservative-bound redetection (Phase 4) ─────────────────────────
+        # Detection runs outside the CUDA graph (graphs can't branch).
+        # We skip detection when max particle displacement since the last
+        # detection pass is below threshold * r — a conservative bound that
+        # guarantees no contact is missed by more than the OGC radius.
+        r            = float(state["ogc_r"])
+        threshold_sq = (float(state.get("redetect_threshold", 0.3)) * r) ** 2
+        if _force_redetect[0]:
+            _detect_contacts()
+        else:
+            wp.launch(kernel_reset_scalar, dim=1, device=device,
+                      inputs=[max_disp_buf])
+            wp.launch(kernel_max_disp_sq, dim=N, device=device,
+                      inputs=[pos_wp, pos_det_wp, max_disp_buf])
+            if max_disp_buf.numpy()[0] > threshold_sq:
+                _detect_contacts()
+        # ─────────────────────────────────────────────────────────────────────
 
         if _USE_GRAPH:
             snap = _snapshot_params()
@@ -868,7 +904,8 @@ def run_ui(cmd_queue):
     param_callbacks["self_collision"] = lambda v: (
         _self_coll_var.set(int(v)), cmd_queue.put(("param", "self_collision", int(v)))
     )
-    add_slider("Self-collision stiffness", "self_ee_stiff", 0.0, 1.0, DEFAULTS["self_ee_stiff"])
+    add_slider("Self-collision stiffness",   "self_ee_stiff",        0.0, 1.0,  DEFAULTS["self_ee_stiff"])
+    add_slider("Redetect threshold (×r)",   "redetect_threshold",   0.05, 2.0, DEFAULTS["redetect_threshold"], fmt="{:.3f}")
 
     section("Roll A — feeding roll (freely rotating)")
     add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
