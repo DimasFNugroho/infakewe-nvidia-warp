@@ -971,11 +971,25 @@ def run_ui(cmd_queue):
                command=lambda: (send("stop"), root.after(150, root.destroy))
                ).pack(side="left", expand=True, fill="x", padx=2)
 
-    # Explicitly sync toggle states to the sim at startup so the sim process
-    # receives the correct initial values even before the user touches anything.
-    for _key in ("self_collision", "heatmap_mode"):
-        if _key in param_callbacks:
-            param_callbacks[_key](param_vars[_key].get())
+    # Auto-load params-main.json at startup so all saved preferences
+    # (including toggles) are applied without the user needing to click Load.
+    _autoload_path = os.path.join(_SCRIPT_DIR, "params-main.json")
+    if os.path.exists(_autoload_path):
+        try:
+            with open(_autoload_path) as _f:
+                _autoload_data = json.load(_f)
+            for _key, _val in _autoload_data.items():
+                if _key in param_vars and _key in param_callbacks:
+                    param_vars[_key].set(_val)
+                    param_callbacks[_key](_val)
+            for _key, _default in DEFAULTS.items():
+                if _key not in _autoload_data and _key in param_vars and _key in param_callbacks:
+                    param_vars[_key].set(_default)
+                    param_callbacks[_key](_default)
+            _update_n_label()
+            print(f"[ui] auto-loaded {_autoload_path}", flush=True)
+        except Exception as _e:
+            print(f"[ui] auto-load failed: {_e}", flush=True)
 
     def on_close():
         send("stop")
