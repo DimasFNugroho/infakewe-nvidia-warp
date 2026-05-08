@@ -734,6 +734,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                               shading="smooth", parent=view.scene)
     cyl2_vis   = visuals.Mesh(vertices=vc2, faces=fc2, color=CYL2_COL,
                               shading="smooth", parent=view.scene)
+    cyl2_vis.set_gl_state("translucent", depth_test=True)
     cyl2_vis.visible = bool(int(state.get("cyl2_enabled", 0)))
 
     p = pos_wp.numpy()
@@ -764,11 +765,13 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     sensor_sphere_a = visuals.Mesh(
         vertices=_sphere_verts(_sc_a0, DEFAULTS["sensor_a_r"]),
         faces=_sphere_faces,
-        color=(1.0, 0.85, 0.0, 0.22), shading="smooth", parent=view.scene)
+        color=(1.0, 0.85, 0.0, 0.45), shading="smooth", parent=view.scene)
     sensor_sphere_b = visuals.Mesh(
         vertices=_sphere_verts(_sc_b0, DEFAULTS["sensor_b_r"]),
         faces=_sphere_faces,
-        color=(0.0, 0.85, 0.25, 0.22), shading="smooth", parent=view.scene)
+        color=(0.0, 0.85, 0.25, 0.45), shading="smooth", parent=view.scene)
+    sensor_sphere_a.set_gl_state("translucent", depth_test=True)
+    sensor_sphere_b.set_gl_state("translucent", depth_test=True)
 
     # Small opaque centre dots — visible through the transparent mesh.
     sensor_dot_a = visuals.Markers(parent=view.scene)
