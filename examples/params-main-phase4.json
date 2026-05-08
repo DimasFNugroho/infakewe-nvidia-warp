@@ -41,5 +41,10 @@
   "sensor_b_x": 0.2,
   "sensor_b_y": -0.1,
   "sensor_b_z": 0.2,
-  "sensor_b_r": 0.05
+  "sensor_b_r": 0.05,
+  "cyl2_x": 0.0,
+  "cyl2_y": 0.0,
+  "cyl2_z": 0.3,
+  "cyl2_radius": 0.05,
+  "cyl2_enabled": 0
 }

@@ -80,6 +80,12 @@ DEFAULTS = {
     "cyl_y":            -0.32444444444444454,
     "cyl_z":            -0.03111111111111109,
     "cyl_radius":        0.08,
+    # Frictionless guide cylinder (redirects yarn, no friction)
+    "cyl2_x":            0.0,
+    "cyl2_y":            0.0,
+    "cyl2_z":            0.3,
+    "cyl2_radius":       0.05,
+    "cyl2_enabled":      0,     # 0 = off, 1 = on
 }
 
 
@@ -130,6 +136,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     ROLL_A_COL = (0.20, 0.50, 0.90, 0.80)   # blue  — feeding roll
     ROLL_B_COL = (0.90, 0.45, 0.10, 0.80)   # orange — pulling roll
     CYL_COL    = (0.25, 0.70, 0.45, 0.75)   # green  — guide cylinder
+    CYL2_COL   = (0.85, 0.85, 0.85, 0.60)   # light grey — frictionless guide
     ANCHOR_COL = (0.0,  0.83, 1.0)           # cyan marker — particle 0
     PULL_COL   = (1.0,  0.65, 0.0)           # amber marker — particle N-1
 
@@ -266,13 +273,15 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         return build_cylinder(state[sx], state[sy], state[sz],
                               state[sr], CYL_HALF_H, n_segs=CYL_N_SEGS)
 
-    mesh_a   = _cyl("roll_a_x", "roll_a_y", "roll_a_z", "roll_a_radius")
-    mesh_b   = _cyl("roll_b_x", "roll_b_y", "roll_b_z", "roll_b_radius")
-    mesh_mid = _cyl("cyl_x",    "cyl_y",    "cyl_z",    "cyl_radius")
+    mesh_a    = _cyl("roll_a_x", "roll_a_y", "roll_a_z", "roll_a_radius")
+    mesh_b    = _cyl("roll_b_x", "roll_b_y", "roll_b_z", "roll_b_radius")
+    mesh_mid  = _cyl("cyl_x",    "cyl_y",    "cyl_z",    "cyl_radius")
+    mesh_cyl2 = _cyl("cyl2_x",   "cyl2_y",   "cyl2_z",   "cyl2_radius")
 
-    obs_a   = ObstacleGPU(mesh_a,   device)
-    obs_b   = ObstacleGPU(mesh_b,   device)
-    obs_mid = ObstacleGPU(mesh_mid, device)
+    obs_a    = ObstacleGPU(mesh_a,    device)
+    obs_b    = ObstacleGPU(mesh_b,    device)
+    obs_mid  = ObstacleGPU(mesh_mid,  device)
+    obs_cyl2 = ObstacleGPU(mesh_cyl2, device)
 
     # ── Yarn GPU arrays ───────────────────────────────────────────────────────
     pos_np, n_wound = make_initial_positions()
@@ -295,9 +304,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     n_bend = N - 2
 
     # ── Contact arrays — one set per obstacle ─────────────────────────────────
-    vf_a   = VFContacts(N, device);   ee_a   = EEContacts(N - 1, device)
-    vf_b   = VFContacts(N, device);   ee_b   = EEContacts(N - 1, device)
-    vf_mid = VFContacts(N, device);   ee_mid = EEContacts(N - 1, device)
+    vf_a    = VFContacts(N, device);   ee_a    = EEContacts(N - 1, device)
+    vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
+    vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
+    vf_cyl2 = VFContacts(N, device);   ee_cyl2 = EEContacts(N - 1, device)
 
     # Self-collision contact array (yarn vs. yarn).
     self_ee = SelfEEContacts(N - 1, device)
@@ -307,11 +317,15 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     max_disp_buf = wp.zeros(1, dtype=float,   device=device)  # scalar accumulator
     _force_redetect = [True]   # True → skip threshold check, always detect
 
-    # List-of-lists so individual obstacles can be hot-swapped.
+    # contacts: Roll A (index 0, special friction), Roll B + main guide (index 1+, full friction).
+    # frictionless_contacts: projection + normal damping only, no friction kernels.
     contacts = [
         [obs_a,   vf_a,   ee_a],
         [obs_b,   vf_b,   ee_b],
         [obs_mid, vf_mid, ee_mid],
+    ]
+    frictionless_contacts = [
+        [obs_cyl2, vf_cyl2, ee_cyl2],
     ]
 
     # ── Particle-count reinit ─────────────────────────────────────────────────
@@ -324,6 +338,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
+        nonlocal vf_cyl2, ee_cyl2, frictionless_contacts
         nonlocal yarn_colors, pos_det_wp, max_disp_buf
 
         N = max(4, new_N)
@@ -348,9 +363,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         edges_np      = np.stack([np.arange(N - 1), np.arange(1, N)], axis=1).astype(np.int32)
         yarn_edges_wp = wp.array(edges_np, dtype=wp.vec2i, device=device)
 
-        vf_a   = VFContacts(N, device);   ee_a   = EEContacts(N - 1, device)
-        vf_b   = VFContacts(N, device);   ee_b   = EEContacts(N - 1, device)
-        vf_mid = VFContacts(N, device);   ee_mid = EEContacts(N - 1, device)
+        vf_a    = VFContacts(N, device);   ee_a    = EEContacts(N - 1, device)
+        vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
+        vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
+        vf_cyl2 = VFContacts(N, device);   ee_cyl2 = EEContacts(N - 1, device)
         self_ee = SelfEEContacts(N - 1, device)
 
         # Preserve existing obstacle GPU objects; only contact arrays change.
@@ -358,6 +374,9 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             [contacts[0][0], vf_a,   ee_a],
             [contacts[1][0], vf_b,   ee_b],
             [contacts[2][0], vf_mid, ee_mid],
+        ]
+        frictionless_contacts = [
+            [frictionless_contacts[0][0], vf_cyl2, ee_cyl2],
         ]
 
         pos_det_wp   = wp.zeros(N, dtype=wp.vec3, device=device)
@@ -557,9 +576,14 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
             # Re-detect contacts every substep so projections use fresh contacts.
             # (Detection kernels are GPU-only and safe inside a CUDA graph.)
+            cyl2_on = bool(int(state.get("cyl2_enabled", 0)))
             for obs, vf, ee in contacts:
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
+            if cyl2_on:
+                for obs, vf, ee in frictionless_contacts:
+                    detect_vertex_facet(pos_wp, obs, vf, r, device)
+                    detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
             if self_coll_on:
                 detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device,
                                n_wound=n_wound)
@@ -573,12 +597,14 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                 for obs, vf, ee in contacts:
                     project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
                     project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
+                if cyl2_on:
+                    for obs, vf, ee in frictionless_contacts:
+                        project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
+                        project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
                 if self_coll_on:
                     project_self_ee(pos_wp, inv_mass_wp, yarn_edges_wp,
                                     self_ee, r, self_ee_stiff, device)
-            # Roll A (contacts[0]): friction only on free-span particles — wound
-            # particles follow the roll kinematically and must not be locked by
-            # surface friction or the Capstan strain gradient is destroyed.
+            # Roll A (contacts[0]): friction only on free-span particles.
             obs_a_entry, vf_a_cur, ee_a_cur = contacts[0]
             apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                               vf_a_cur, r, mu_s, mu_k, device,
@@ -591,6 +617,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                                   vf, r, mu_s, mu_k, device)
                 apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   yarn_edges_wp, ee, r, mu_s, mu_k, device)
+            # frictionless_contacts: no friction kernels — only normal damping.
             if self_coll_on:
                 apply_self_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                        yarn_edges_wp, self_ee, r, mu_s, mu_k, device)
@@ -598,6 +625,9 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                       inputs=[pos_wp, prev_pos_wp, vel_wp, inv_mass_wp, inv_sdt])
             for obs, vf, ee in contacts:
                 damp_normal_velocity(vel_wp, inv_mass_wp, vf, r, device)
+            if cyl2_on:
+                for obs, vf, ee in frictionless_contacts:
+                    damp_normal_velocity(vel_wp, inv_mass_wp, vf, r, device)
             clamp_velocity(vel_wp, v_max, device)
 
     def _detect_contacts():
@@ -607,6 +637,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         for obs, vf, ee in contacts:
             detect_vertex_facet(pos_wp, obs, vf, r, device)
             detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
+        if bool(int(state.get("cyl2_enabled", 0))):
+            for obs, vf, ee in frictionless_contacts:
+                detect_vertex_facet(pos_wp, obs, vf, r, device)
+                detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
         if self_coll:
             detect_self_ee(pos_wp, yarn_edges_wp, self_ee, r, device, n_wound=n_wound)
         _force_redetect[0] = False
@@ -688,15 +722,19 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     )
     visuals.XYZAxis(parent=view.scene)
 
-    va, fa = mesh_for_render(mesh_a)
-    vb, fb = mesh_for_render(mesh_b)
-    vm, fm = mesh_for_render(mesh_mid)
-    roll_a_vis = visuals.Mesh(vertices=va, faces=fa, color=ROLL_A_COL,
+    va, fa   = mesh_for_render(mesh_a)
+    vb, fb   = mesh_for_render(mesh_b)
+    vm, fm   = mesh_for_render(mesh_mid)
+    vc2, fc2 = mesh_for_render(mesh_cyl2)
+    roll_a_vis = visuals.Mesh(vertices=va,  faces=fa,  color=ROLL_A_COL,
                               shading="smooth", parent=view.scene)
-    roll_b_vis = visuals.Mesh(vertices=vb, faces=fb, color=ROLL_B_COL,
+    roll_b_vis = visuals.Mesh(vertices=vb,  faces=fb,  color=ROLL_B_COL,
                               shading="smooth", parent=view.scene)
-    cyl_vis    = visuals.Mesh(vertices=vm, faces=fm, color=CYL_COL,
+    cyl_vis    = visuals.Mesh(vertices=vm,  faces=fm,  color=CYL_COL,
                               shading="smooth", parent=view.scene)
+    cyl2_vis   = visuals.Mesh(vertices=vc2, faces=fc2, color=CYL2_COL,
+                              shading="smooth", parent=view.scene)
+    cyl2_vis.visible = bool(int(state.get("cyl2_enabled", 0)))
 
     p = pos_wp.numpy()
     yarn_colors = make_yarn_colors(N)
@@ -790,6 +828,13 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         cyl_vis.set_data(vertices=vv, faces=ff, color=CYL_COL)
         _graph[0] = None
 
+    def rebuild_cyl2():
+        new_mesh = _cyl("cyl2_x", "cyl2_y", "cyl2_z", "cyl2_radius")
+        frictionless_contacts[0][0] = ObstacleGPU(new_mesh, device)
+        vv, ff = mesh_for_render(new_mesh)
+        cyl2_vis.set_data(vertices=vv, faces=ff, color=CYL2_COL)
+        _graph[0] = None
+
     # ── Main tick ─────────────────────────────────────────────────────────────
     def on_timer(_event):
         try:
@@ -827,6 +872,11 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                         rebuild_roll_b()
                     elif key in ("cyl_x", "cyl_y", "cyl_z", "cyl_radius"):
                         rebuild_guide()
+                    elif key in ("cyl2_x", "cyl2_y", "cyl2_z", "cyl2_radius"):
+                        rebuild_cyl2()
+                    elif key == "cyl2_enabled":
+                        cyl2_vis.visible = bool(int(value))
+                        _graph[0] = None
                     elif key == "particle_mass":
                         inv_mass_wp.assign(
                             wp.array(make_inv_mass(), dtype=float, device=device)
@@ -1096,6 +1146,23 @@ def run_ui(cmd_queue, shared):
     add_slider("Guide Y",      "cyl_y",      -3.0,  3.0, DEFAULTS["cyl_y"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide Z",      "cyl_z",      -3.0,  3.0, DEFAULTS["cyl_z"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide radius", "cyl_radius",  0.02, 0.5, DEFAULTS["cyl_radius"])
+
+    section("Frictionless guide cylinder (light grey)")
+    _cyl2_en_var = tk.IntVar(value=DEFAULTS["cyl2_enabled"])
+    _cyl2_en_frm = ttk.Frame(scroll_frm)
+    _cyl2_en_frm.pack(fill="x", padx=8, pady=3)
+    def _on_cyl2_toggle():
+        cmd_queue.put(("param", "cyl2_enabled", _cyl2_en_var.get()))
+    ttk.Checkbutton(_cyl2_en_frm, text="Enable frictionless guide",
+                    variable=_cyl2_en_var, command=_on_cyl2_toggle).pack(side="left")
+    param_vars["cyl2_enabled"]      = _cyl2_en_var
+    param_callbacks["cyl2_enabled"] = lambda v: (
+        _cyl2_en_var.set(int(v)), cmd_queue.put(("param", "cyl2_enabled", int(v)))
+    )
+    add_slider("Frictionless guide X",      "cyl2_x",      -3.0, 3.0, DEFAULTS["cyl2_x"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Frictionless guide Y",      "cyl2_y",      -3.0, 3.0, DEFAULTS["cyl2_y"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Frictionless guide Z",      "cyl2_z",      -3.0, 3.0, DEFAULTS["cyl2_z"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Frictionless guide radius", "cyl2_radius",  0.02, 0.5, DEFAULTS["cyl2_radius"])
 
     # ── Save / Load ───────────────────────────────────────────────────────────
 
