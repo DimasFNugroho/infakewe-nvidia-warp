@@ -925,21 +925,25 @@ def run_ui(cmd_queue, shared):
     param_vars      = {}   # key → DoubleVar
     param_callbacks = {}   # key → on_change(v)
 
-    def add_slider(label, key, from_, to_, default, is_int=False, fmt="{:.3f}"):
+    def add_slider(label, key, from_, to_, default, is_int=False, fmt="{:.3f}",
+                   editable_range=False):
         frm = ttk.Frame(scroll_frm)
         frm.pack(fill="x", padx=8, pady=3)
         ttk.Label(frm, text=label, width=22).pack(side="left")
 
-        val_var  = tk.DoubleVar(value=default)
+        val_var   = tk.DoubleVar(value=default)
         init_disp = f"{int(default)} / {int(to_)}" if is_int else fmt.format(default)
-        disp_var = tk.StringVar(value=init_disp)
+        disp_var  = tk.StringVar(value=init_disp)
         ttk.Label(frm, textvariable=disp_var, width=10).pack(side="right")
+
+        # Mutable range so inner closures can update it.
+        _range = [from_, to_]
 
         def on_change(v):
             if is_int:
                 iv = int(round(float(v)))
                 val_var.set(iv)
-                disp_var.set(f"{iv} / {int(to_)}")
+                disp_var.set(f"{iv} / {int(_range[1])}")
                 cmd_queue.put(("param", key, iv))
             else:
                 fv = float(v)
@@ -947,10 +951,48 @@ def run_ui(cmd_queue, shared):
                 disp_var.set(fmt.format(fv))
                 cmd_queue.put(("param", key, fv))
 
-        ttk.Scale(frm, from_=from_, to=to_, variable=val_var,
-                  orient="horizontal", command=on_change).pack(
-            side="left", fill="x", expand=True, padx=6,
-        )
+        scale = ttk.Scale(frm, from_=_range[0], to=_range[1], variable=val_var,
+                          orient="horizontal", command=on_change)
+        scale.pack(side="left", fill="x", expand=True, padx=6)
+
+        if editable_range:
+            # Second row: [min entry] [max entry] with labels
+            range_frm = ttk.Frame(scroll_frm)
+            range_frm.pack(fill="x", padx=8, pady=(0, 2))
+            ttk.Label(range_frm, text="  range:", width=9,
+                      foreground="#888888").pack(side="left")
+
+            min_var = tk.StringVar(value=str(from_))
+            max_var = tk.StringVar(value=str(to_))
+
+            def _apply_range(*_):
+                try:
+                    new_lo = (int if is_int else float)(min_var.get())
+                    new_hi = (int if is_int else float)(max_var.get())
+                    if new_lo >= new_hi:
+                        return
+                    _range[0] = new_lo;  _range[1] = new_hi
+                    scale.configure(from_=new_lo, to=new_hi)
+                    # Re-clamp current value if outside new range.
+                    cur = val_var.get()
+                    if cur < new_lo:
+                        val_var.set(new_lo);  on_change(new_lo)
+                    elif cur > new_hi:
+                        val_var.set(new_hi);  on_change(new_hi)
+                except ValueError:
+                    pass
+
+            ttk.Label(range_frm, text="min", foreground="#888888").pack(side="left")
+            min_e = ttk.Entry(range_frm, textvariable=min_var, width=8)
+            min_e.pack(side="left", padx=(2, 8))
+            min_e.bind("<Return>", _apply_range)
+            min_e.bind("<FocusOut>", _apply_range)
+
+            ttk.Label(range_frm, text="max", foreground="#888888").pack(side="left")
+            max_e = ttk.Entry(range_frm, textvariable=max_var, width=8)
+            max_e.pack(side="left", padx=2)
+            max_e.bind("<Return>", _apply_range)
+            max_e.bind("<FocusOut>", _apply_range)
 
         param_vars[key]      = val_var
         param_callbacks[key] = on_change
@@ -1002,7 +1044,7 @@ def run_ui(cmd_queue, shared):
     param_vars["ogc_r"].trace_add("write", lambda *_: _update_n_label())
     add_slider("Contact stiffness",    "ogc_stiff",    0.0,   1.0,  DEFAULTS["ogc_stiff"])
     add_slider("Friction μ_static",    "mu_static",    0.0,   1.0,  DEFAULTS["mu_static"])
-    add_slider("Friction μ_kinetic",   "mu_kinetic",   0.0,   1.0,  DEFAULTS["mu_kinetic"])
+    add_slider("Friction μ_kinetic",   "mu_kinetic",   0.0,   1.0,  DEFAULTS["mu_kinetic"], editable_range=True)
     add_slider("Velocity max (m/s)",   "v_max",        0.0,  100.0, DEFAULTS["v_max"],       fmt="{:.1f}")
 
     section("Yarn self-collision")
@@ -1050,9 +1092,9 @@ def run_ui(cmd_queue, shared):
     add_slider("Pull speed (m/s)", "pull_speed",  -5.0,  5.0, DEFAULTS["pull_speed"],    fmt="{:+.3f}")
 
     section("Guide cylinder")
-    add_slider("Guide X",      "cyl_x",      -3.0,  3.0, DEFAULTS["cyl_x"],      fmt="{:+.3f}")
-    add_slider("Guide Y",      "cyl_y",      -3.0,  3.0, DEFAULTS["cyl_y"],      fmt="{:+.3f}")
-    add_slider("Guide Z",      "cyl_z",      -3.0,  3.0, DEFAULTS["cyl_z"],      fmt="{:+.3f}")
+    add_slider("Guide X",      "cyl_x",      -3.0,  3.0, DEFAULTS["cyl_x"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Guide Y",      "cyl_y",      -3.0,  3.0, DEFAULTS["cyl_y"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Guide Z",      "cyl_z",      -3.0,  3.0, DEFAULTS["cyl_z"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide radius", "cyl_radius",  0.02, 0.5, DEFAULTS["cyl_radius"])
 
     # ── Save / Load ───────────────────────────────────────────────────────────
