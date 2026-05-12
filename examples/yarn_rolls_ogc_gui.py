@@ -65,10 +65,14 @@ DEFAULTS = {
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
     # Tension sensor A (upstream, yellow) — place on Roll-A side of guide
     "sensor_a_x":  -0.30,  "sensor_a_y":  0.10,  "sensor_a_z":  0.00,
-    "sensor_a_r":   0.05,
+    "sensor_a_r":   0.05,   # detection sphere radius
+    "sensor_a_cyl_r":    0.03,   # physical frictionless cylinder radius
+    "sensor_a_cyl_enabled": 0,
     # Tension sensor B (downstream, green) — place on Roll-B side of guide
     "sensor_b_x":   0.20,  "sensor_b_y": -0.10,  "sensor_b_z":  0.20,
-    "sensor_b_r":   0.05,
+    "sensor_b_r":   0.05,   # detection sphere radius
+    "sensor_b_cyl_r":    0.03,   # physical frictionless cylinder radius
+    "sensor_b_cyl_enabled": 0,
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
@@ -273,15 +277,19 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         return build_cylinder(state[sx], state[sy], state[sz],
                               state[sr], CYL_HALF_H, n_segs=CYL_N_SEGS)
 
-    mesh_a    = _cyl("roll_a_x", "roll_a_y", "roll_a_z", "roll_a_radius")
-    mesh_b    = _cyl("roll_b_x", "roll_b_y", "roll_b_z", "roll_b_radius")
-    mesh_mid  = _cyl("cyl_x",    "cyl_y",    "cyl_z",    "cyl_radius")
-    mesh_cyl2 = _cyl("cyl2_x",   "cyl2_y",   "cyl2_z",   "cyl2_radius")
+    mesh_a    = _cyl("roll_a_x",    "roll_a_y",    "roll_a_z",    "roll_a_radius")
+    mesh_b    = _cyl("roll_b_x",    "roll_b_y",    "roll_b_z",    "roll_b_radius")
+    mesh_mid  = _cyl("cyl_x",       "cyl_y",       "cyl_z",       "cyl_radius")
+    mesh_cyl2 = _cyl("cyl2_x",      "cyl2_y",      "cyl2_z",      "cyl2_radius")
+    mesh_scA  = _cyl("sensor_a_x",  "sensor_a_y",  "sensor_a_z",  "sensor_a_cyl_r")
+    mesh_scB  = _cyl("sensor_b_x",  "sensor_b_y",  "sensor_b_z",  "sensor_b_cyl_r")
 
-    obs_a    = ObstacleGPU(mesh_a,    device)
-    obs_b    = ObstacleGPU(mesh_b,    device)
-    obs_mid  = ObstacleGPU(mesh_mid,  device)
+    obs_a    = ObstacleGPU(mesh_a,   device)
+    obs_b    = ObstacleGPU(mesh_b,   device)
+    obs_mid  = ObstacleGPU(mesh_mid, device)
     obs_cyl2 = ObstacleGPU(mesh_cyl2, device)
+    obs_scA  = ObstacleGPU(mesh_scA,  device)
+    obs_scB  = ObstacleGPU(mesh_scB,  device)
 
     # ── Yarn GPU arrays ───────────────────────────────────────────────────────
     pos_np, n_wound = make_initial_positions()
@@ -308,24 +316,29 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
     vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
     vf_cyl2 = VFContacts(N, device);   ee_cyl2 = EEContacts(N - 1, device)
+    vf_scA  = VFContacts(N, device);   ee_scA  = EEContacts(N - 1, device)
+    vf_scB  = VFContacts(N, device);   ee_scB  = EEContacts(N - 1, device)
 
     # Self-collision contact array (yarn vs. yarn).
     self_ee = SelfEEContacts(N - 1, device)
 
     # ── Conservative-bound redetection buffers (Phase 4) ─────────────────────
-    pos_det_wp  = wp.zeros(N, dtype=wp.vec3, device=device)  # positions at last detection
-    max_disp_buf = wp.zeros(1, dtype=float,   device=device)  # scalar accumulator
-    _force_redetect = [True]   # True → skip threshold check, always detect
+    pos_det_wp  = wp.zeros(N, dtype=wp.vec3, device=device)
+    max_disp_buf = wp.zeros(1, dtype=float,   device=device)
+    _force_redetect = [True]
 
     # contacts: Roll A (index 0, special friction), Roll B + main guide (index 1+, full friction).
     # frictionless_contacts: projection + normal damping only, no friction kernels.
+    # Each entry is [obstacle, vf_contacts, ee_contacts, enabled_key].
     contacts = [
         [obs_a,   vf_a,   ee_a],
         [obs_b,   vf_b,   ee_b],
         [obs_mid, vf_mid, ee_mid],
     ]
     frictionless_contacts = [
-        [obs_cyl2, vf_cyl2, ee_cyl2],
+        [obs_cyl2, vf_cyl2, ee_cyl2, "cyl2_enabled"],
+        [obs_scA,  vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
+        [obs_scB,  vf_scB,  ee_scB,  "sensor_b_cyl_enabled"],
     ]
 
     # ── Particle-count reinit ─────────────────────────────────────────────────
@@ -338,7 +351,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
-        nonlocal vf_cyl2, ee_cyl2, frictionless_contacts
+        nonlocal vf_cyl2, ee_cyl2, vf_scA, ee_scA, vf_scB, ee_scB, frictionless_contacts
         nonlocal yarn_colors, pos_det_wp, max_disp_buf
 
         N = max(4, new_N)
@@ -367,16 +380,19 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
         vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
         vf_cyl2 = VFContacts(N, device);   ee_cyl2 = EEContacts(N - 1, device)
+        vf_scA  = VFContacts(N, device);   ee_scA  = EEContacts(N - 1, device)
+        vf_scB  = VFContacts(N, device);   ee_scB  = EEContacts(N - 1, device)
         self_ee = SelfEEContacts(N - 1, device)
 
-        # Preserve existing obstacle GPU objects; only contact arrays change.
         contacts = [
             [contacts[0][0], vf_a,   ee_a],
             [contacts[1][0], vf_b,   ee_b],
             [contacts[2][0], vf_mid, ee_mid],
         ]
         frictionless_contacts = [
-            [frictionless_contacts[0][0], vf_cyl2, ee_cyl2],
+            [frictionless_contacts[0][0], vf_cyl2, ee_cyl2, "cyl2_enabled"],
+            [frictionless_contacts[1][0], vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
+            [frictionless_contacts[2][0], vf_scB,  ee_scB,  "sensor_b_cyl_enabled"],
         ]
 
         pos_det_wp   = wp.zeros(N, dtype=wp.vec3, device=device)
@@ -576,12 +592,11 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
             # Re-detect contacts every substep so projections use fresh contacts.
             # (Detection kernels are GPU-only and safe inside a CUDA graph.)
-            cyl2_on = bool(int(state.get("cyl2_enabled", 0)))
             for obs, vf, ee in contacts:
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
-            if cyl2_on:
-                for obs, vf, ee in frictionless_contacts:
+            for obs, vf, ee, ekey in frictionless_contacts:
+                if bool(int(state.get(ekey, 0))):
                     detect_vertex_facet(pos_wp, obs, vf, r, device)
                     detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
             if self_coll_on:
@@ -597,8 +612,8 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                 for obs, vf, ee in contacts:
                     project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
                     project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
-                if cyl2_on:
-                    for obs, vf, ee in frictionless_contacts:
+                for obs, vf, ee, ekey in frictionless_contacts:
+                    if bool(int(state.get(ekey, 0))):
                         project_vf(pos_wp, inv_mass_wp, vf, r, stiff, device)
                         project_ee(pos_wp, inv_mass_wp, yarn_edges_wp, ee, r, stiff, device)
                 if self_coll_on:
@@ -617,7 +632,6 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                                   vf, r, mu_s, mu_k, device)
                 apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                   yarn_edges_wp, ee, r, mu_s, mu_k, device)
-            # frictionless_contacts: no friction kernels — only normal damping.
             if self_coll_on:
                 apply_self_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                        yarn_edges_wp, self_ee, r, mu_s, mu_k, device)
@@ -625,8 +639,8 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                       inputs=[pos_wp, prev_pos_wp, vel_wp, inv_mass_wp, inv_sdt])
             for obs, vf, ee in contacts:
                 damp_normal_velocity(vel_wp, inv_mass_wp, vf, r, device)
-            if cyl2_on:
-                for obs, vf, ee in frictionless_contacts:
+            for obs, vf, ee, ekey in frictionless_contacts:
+                if bool(int(state.get(ekey, 0))):
                     damp_normal_velocity(vel_wp, inv_mass_wp, vf, r, device)
             clamp_velocity(vel_wp, v_max, device)
 
@@ -637,8 +651,8 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         for obs, vf, ee in contacts:
             detect_vertex_facet(pos_wp, obs, vf, r, device)
             detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
-        if bool(int(state.get("cyl2_enabled", 0))):
-            for obs, vf, ee in frictionless_contacts:
+        for obs, vf, ee, ekey in frictionless_contacts:
+            if bool(int(state.get(ekey, 0))):
                 detect_vertex_facet(pos_wp, obs, vf, r, device)
                 detect_edge_edge(pos_wp, yarn_edges_wp, obs, ee, r, device)
         if self_coll:
@@ -722,20 +736,27 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     )
     visuals.XYZAxis(parent=view.scene)
 
-    va, fa   = mesh_for_render(mesh_a)
-    vb, fb   = mesh_for_render(mesh_b)
-    vm, fm   = mesh_for_render(mesh_mid)
-    vc2, fc2 = mesh_for_render(mesh_cyl2)
-    roll_a_vis = visuals.Mesh(vertices=va,  faces=fa,  color=ROLL_A_COL,
-                              shading="smooth", parent=view.scene)
-    roll_b_vis = visuals.Mesh(vertices=vb,  faces=fb,  color=ROLL_B_COL,
-                              shading="smooth", parent=view.scene)
-    cyl_vis    = visuals.Mesh(vertices=vm,  faces=fm,  color=CYL_COL,
-                              shading="smooth", parent=view.scene)
-    cyl2_vis   = visuals.Mesh(vertices=vc2, faces=fc2, color=CYL2_COL,
-                              shading="smooth", parent=view.scene)
+    va,   fa   = mesh_for_render(mesh_a)
+    vb,   fb   = mesh_for_render(mesh_b)
+    vm,   fm   = mesh_for_render(mesh_mid)
+    vc2,  fc2  = mesh_for_render(mesh_cyl2)
+    vsA,  fsA  = mesh_for_render(mesh_scA)
+    vsB,  fsB  = mesh_for_render(mesh_scB)
+
+    # Sensor cylinder colour: solid, matches sensor dot colour
+    SCY_A_COL = (1.0, 0.85, 0.0, 1.0)   # yellow — sensor A
+    SCY_B_COL = (0.0, 0.85, 0.25, 1.0)  # green  — sensor B
+
+    roll_a_vis  = visuals.Mesh(vertices=va,  faces=fa,  color=ROLL_A_COL,  shading="smooth", parent=view.scene)
+    roll_b_vis  = visuals.Mesh(vertices=vb,  faces=fb,  color=ROLL_B_COL,  shading="smooth", parent=view.scene)
+    cyl_vis     = visuals.Mesh(vertices=vm,  faces=fm,  color=CYL_COL,     shading="smooth", parent=view.scene)
+    cyl2_vis    = visuals.Mesh(vertices=vc2, faces=fc2, color=CYL2_COL,    shading="smooth", parent=view.scene)
+    scA_vis     = visuals.Mesh(vertices=vsA, faces=fsA, color=SCY_A_COL,   shading="smooth", parent=view.scene)
+    scB_vis     = visuals.Mesh(vertices=vsB, faces=fsB, color=SCY_B_COL,   shading="smooth", parent=view.scene)
     cyl2_vis.set_gl_state("translucent", depth_test=True)
     cyl2_vis.visible = bool(int(state.get("cyl2_enabled", 0)))
+    scA_vis.visible  = bool(int(state.get("sensor_a_cyl_enabled", 0)))
+    scB_vis.visible  = bool(int(state.get("sensor_b_cyl_enabled", 0)))
 
     p = pos_wp.numpy()
     yarn_colors = make_yarn_colors(N)
@@ -838,6 +859,411 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         cyl2_vis.set_data(vertices=vv, faces=ff, color=CYL2_COL)
         _graph[0] = None
 
+    def rebuild_scA():
+        new_mesh = _cyl("sensor_a_x", "sensor_a_y", "sensor_a_z", "sensor_a_cyl_r")
+        frictionless_contacts[1][0] = ObstacleGPU(new_mesh, device)
+        vv, ff = mesh_for_render(new_mesh)
+        scA_vis.set_data(vertices=vv, faces=ff, color=SCY_A_COL)
+        _graph[0] = None
+
+    def rebuild_scB():
+        new_mesh = _cyl("sensor_b_x", "sensor_b_y", "sensor_b_z", "sensor_b_cyl_r")
+        frictionless_contacts[2][0] = ObstacleGPU(new_mesh, device)
+        vv, ff = mesh_for_render(new_mesh)
+        scB_vis.set_data(vertices=vv, faces=ff, color=SCY_B_COL)
+        _graph[0] = None
+
+    # ── Sensor gizmo — keyboard select, mouse drag to move ───────────────────────
+    # vispy is not a 3D editor; reliable click-picking of small 3D objects is not
+    # supported. Instead: press A or B to select a sensor, drag to move it, hold
+    # X / Y / Z while dragging to constrain to that world axis, Escape to deselect.
+    #
+    # Gizmo arrows (X=red, Y=green, Z=blue) are shown as visual reference only.
+    # Camera orbit still works whenever no drag is in progress.
+
+    _GIZMO_LEN = 0.30
+
+    _AX_DIRS = {
+        "X": np.array([1.0, 0.0, 0.0]),
+        "Y": np.array([0.0, 1.0, 0.0]),
+        "Z": np.array([0.0, 0.0, 1.0]),
+    }
+    _AX_COLS = {
+        "X": np.array([0.95, 0.20, 0.20, 1.0]),
+        "Y": np.array([0.20, 0.90, 0.20, 1.0]),
+        "Z": np.array([0.25, 0.50, 1.00, 1.0]),
+    }
+    _AX_HOT = np.array([1.0, 0.85, 0.0, 1.0])
+
+    _sel = {
+        "who":       None,   # "A" or "B" — selected sensor
+        "axis_lock": None,   # "X","Y","Z" or None — held key constraint
+        "dragging":  False,
+        "drag_start_mouse": None,
+        "drag_start_world": None,
+    }
+
+    def _sensor_center(who):
+        return np.array(_sphere_centers[0 if who == "sensor_a" else 1], dtype=float)
+
+    def _object_center(who):
+        """Return world-space centre for any pickable object."""
+        if who == "sensor_a":
+            return np.array(_sphere_centers[0], dtype=float)
+        if who == "sensor_b":
+            return np.array(_sphere_centers[1], dtype=float)
+        key_map = {
+            "roll_a": ("roll_a_x", "roll_a_y", "roll_a_z"),
+            "roll_b": ("roll_b_x", "roll_b_y", "roll_b_z"),
+            "cyl":    ("cyl_x",    "cyl_y",    "cyl_z"),
+            "cyl2":   ("cyl2_x",   "cyl2_y",   "cyl2_z"),
+        }
+        kx, ky, kz = key_map[who]
+        return np.array([state[kx], state[ky], state[kz]], dtype=float)
+
+    # Single shared gizmo — repositioned to whichever object is selected.
+    gizmo_line = visuals.Line(pos=np.zeros((6, 3), dtype=np.float32),
+                              color=np.ones((6, 4), dtype=np.float32),
+                              width=3, connect="segments", parent=view.scene)
+    gizmo_line.visible = False
+
+    def _refresh_gizmos():
+        if _sel["who"] is None:
+            gizmo_line.visible = False
+            return
+        c    = _object_center(_sel["who"])
+        lock = _sel["axis_lock"]
+        pts  = np.empty((6, 3), dtype=np.float32)
+        cols = np.empty((6, 4), dtype=np.float32)
+        for i, name in enumerate(["X", "Y", "Z"]):
+            tip  = (c + _AX_DIRS[name] * _GIZMO_LEN).astype(np.float32)
+            col  = _AX_HOT if name == lock else _AX_COLS[name]
+            pts[i*2] = c;    pts[i*2+1] = tip
+            cols[i*2] = col; cols[i*2+1] = col
+        gizmo_line.set_data(pos=pts, color=cols)
+        gizmo_line.visible = True
+
+    def _screen_delta_to_world(d_screen):
+        """Convert a 2-element screen-pixel delta to a world-space 3-D vector.
+
+        Uses the exact same formula that vispy TurntableCamera uses for
+        Shift+drag panning, so the result is guaranteed to match the rendered
+        view regardless of camera orientation.
+
+        d_screen: (dx, dy) in screen pixels, positive = right / down.
+        Returns a world-space np.ndarray([dx, dy, dz]).
+        """
+        cam   = view.camera
+        norm  = float(np.mean(cam._viewbox.size))
+        sf    = float(cam._scale_factor)
+        dist  = np.array([-d_screen[0], d_screen[1]], dtype=float) / norm * sf
+        dx_l, dy_l, dz_l = cam._dist_to_trans(dist)
+        ff               = cam._flip_factors
+        up, forward, right = cam._get_dim_vectors()
+        world = right * dx_l + forward * dy_l + up * dz_l
+        world = np.array([ff[0] * world[0], ff[1] * world[1], ff[2] * world[2]])
+        return -world
+
+    def _cam_axes():
+        """Return (right, up, forward) unit vectors in world space.
+
+        Derived from _screen_delta_to_world so they are always consistent
+        with the pan formula — no trigonometry errors possible.
+          right_w   = direction objects move when cursor goes right (+screen X)
+          up_w      = direction objects move when cursor goes up   (-screen Y)
+          forward_w = cross(right_w, up_w), pointing into the scene
+        """
+        r  = _screen_delta_to_world(np.array([1.0, 0.0]))
+        dn = _screen_delta_to_world(np.array([0.0, 1.0]))  # screen down → world down
+        r  /= np.linalg.norm(r)  + 1e-12
+        u   = -dn / (np.linalg.norm(dn) + 1e-12)          # flip to world up
+        f   = np.cross(r, u)
+        f  /= np.linalg.norm(f)  + 1e-12
+        return r, u, f
+
+    # ── Ray–geometry primitives ───────────────────────────────────────────────
+
+    def _ray_sphere(ro, rd, center, radius):
+        """Return smallest positive t for ray-sphere intersection, or None."""
+        oc = ro - np.array(center, dtype=float)
+        b  = 2.0 * np.dot(oc, rd)
+        c  = np.dot(oc, oc) - radius * radius
+        d  = b * b - 4.0 * c
+        if d < 0:
+            return None
+        sq = np.sqrt(d)
+        t  = (-b - sq) / 2.0
+        if t < 1e-4:
+            t = (-b + sq) / 2.0
+        return t if t > 1e-4 else None
+
+    def _ray_zcylinder(ro, rd, center, radius, half_h):
+        """Return smallest positive t for ray against a Z-aligned capped cylinder,
+        or None.  center is (cx,cy,cz); axis runs from cz-half_h to cz+half_h."""
+        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        # Infinite cylinder (ignore Z) – 2-D problem in XY
+        ox, oy = ro[0] - cx, ro[1] - cy
+        dx, dy = rd[0], rd[1]
+        a  = dx*dx + dy*dy
+        t_best = None
+        if a > 1e-12:
+            b  = 2.0 * (ox*dx + oy*dy)
+            c  = ox*ox + oy*oy - radius*radius
+            d  = b*b - 4.0*a*c
+            if d >= 0:
+                sq = np.sqrt(d)
+                for t in ((-b - sq) / (2*a), (-b + sq) / (2*a)):
+                    if t > 1e-4:
+                        z_hit = ro[2] + t * rd[2]
+                        if cz - half_h <= z_hit <= cz + half_h:
+                            if t_best is None or t < t_best:
+                                t_best = t
+        # End caps (z = cz ± half_h planes)
+        if abs(rd[2]) > 1e-12:
+            for cap_z in (cz - half_h, cz + half_h):
+                t = (cap_z - ro[2]) / rd[2]
+                if t > 1e-4:
+                    x_hit = ro[0] + t * rd[0] - cx
+                    y_hit = ro[1] + t * rd[1] - cy
+                    if x_hit*x_hit + y_hit*y_hit <= radius*radius:
+                        if t_best is None or t < t_best:
+                            t_best = t
+        return t_best
+
+    def _camera_ray(sx, sy):
+        """Return (cam_pos, ray_dir) for screen pixel (sx, sy)."""
+        right_w, up_w, forward_w = _cam_axes()
+        ctr     = np.array(view.camera.center, dtype=float)
+        cam_pos = ctr - float(view.camera.distance) * forward_w
+        cw, ch  = canvas.size
+        half_h  = np.tan(np.radians(view.camera.fov) / 2.0)
+        ndx = (2.0 * sx / cw - 1.0) * (cw / ch) * half_h
+        ndy = (1.0 - 2.0 * sy / ch) * half_h
+        ray_dir = forward_w + right_w * ndx + up_w * ndy
+        ray_dir /= np.linalg.norm(ray_dir) + 1e-12
+        return cam_pos, ray_dir
+
+    # Minimum clickable radius in screen pixels (object selection threshold).
+    _MIN_HIT_PX = 14
+
+    # Camera-pos verification flag — print a one-time comparison on first pick
+    _verified_cam = [False]
+
+    def _camera_ray_vispy(sx, sy):
+        """Construct the world-space ray for canvas pixel (sx, sy) using vispy's
+        actual camera transform.
+
+        Why this is correct: vispy's `cam.transform` is the affine that maps
+        camera-local coordinates to world coordinates (camera-to-world).  We
+        build the ray in camera-local space (origin at 0, target at one unit
+        in front through the pixel) and apply the transform to both points.
+        The resulting (ro, rd) is exactly the ray vispy uses to render.
+
+        This avoids re-deriving cam_pos / forward / right / up analytically,
+        which is brittle: vispy's TurntableCamera composes T(center)·R(az)·
+        R(90+elevation,-X)·R(roll)·T(0,0,-scale_factor), and any sign or
+        axis-flip mismatch in the analytical derivation produces a ray that
+        doesn't match the rendering — which is exactly what was happening.
+        """
+        cam = view.camera
+        cw, ch = canvas.size
+        fov_rad = np.radians(cam.fov)
+        aspect  = cw / ch
+        half_tan = np.tan(fov_rad / 2.0)
+
+        # Pixel → NDC, OpenGL convention (+Y up, -Z forward)
+        ndc_x = 2.0 * sx / cw - 1.0
+        ndc_y = 1.0 - 2.0 * sy / ch
+
+        # In camera-local space: origin and a point at depth 1 in front of camera
+        p0_local = np.array([0.0, 0.0, 0.0])
+        p1_local = np.array([ndc_x * aspect * half_tan, ndc_y * half_tan, -1.0])
+
+        # Apply vispy's camera-to-world transform
+        p0_world = np.asarray(cam.transform.map(p0_local))[:3]
+        p1_world = np.asarray(cam.transform.map(p1_local))[:3]
+
+        ro = p0_world.astype(float)
+        rd = (p1_world - p0_world).astype(float)
+        rd /= np.linalg.norm(rd) + 1e-12
+        return ro, rd
+
+    def _pick_world_pos(sx, sy, plane_pt=None):
+        """Cast a true world-space ray through pixel (sx, sy) and return the
+        front-most object intersection.
+
+        Picking pipeline:
+          1. Build ro, rd using vispy's actual camera transform.
+          2. For each object, intersect ray with its true geometry expanded
+             by pick_r (= max(physical, _MIN_HIT_PX pixels in world units)).
+          3. Sort hits by t (front-most wins) and return that object plus
+             the surface hit point of its true (un-expanded) geometry.
+
+        No screen-space heuristics, no axis projection, no height caps — the
+        ray either intersects a 3D object or it doesn't.
+        """
+        ro, rd = _camera_ray_vispy(sx, sy)
+        cam = view.camera
+        cw, ch  = canvas.size
+        half_tan = np.tan(np.radians(cam.fov) / 2.0)
+
+        # One-time sanity check: compare our previously-analytical cam_pos with
+        # the one vispy actually uses.  If they differ, the analytical version
+        # was wrong (which is why picking was broken).
+        if not _verified_cam[0]:
+            try:
+                right_w, up_w, forward_w = _cam_axes()
+                ctr_a = np.array(cam.center, dtype=float)
+                cam_a = ctr_a - float(cam.distance) * forward_w
+                print(f"[pick] cam_pos analytical={cam_a}  vispy={ro}", flush=True)
+            except Exception as e:
+                print(f"[pick] cam_pos check skipped: {e}", flush=True)
+            _verified_cam[0] = True
+
+        def _pick_r(center, world_r):
+            """World-space pick radius = max(physical, _MIN_HIT_PX pixels at object distance)."""
+            dist = float(np.linalg.norm(np.array(center, float) - ro))
+            one_px = max(dist * 2.0 * half_tan / ch, 1e-6)
+            return max(_MIN_HIT_PX * one_px, world_r)
+
+        # All pickable objects: (center, physical_r, name, is_cylinder)
+        objects = [
+            (tuple(_sphere_centers[0]), float(state.get("sensor_a_r", 0.05)), "sensor_a", False),
+            (tuple(_sphere_centers[1]), float(state.get("sensor_b_r", 0.05)), "sensor_b", False),
+            ((state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]),
+                float(state["roll_a_radius"]), "roll_a", True),
+            ((state["roll_b_x"], state["roll_b_y"], state["roll_b_z"]),
+                float(state["roll_b_radius"]), "roll_b", True),
+            ((state["cyl_x"], state["cyl_y"], state["cyl_z"]),
+                float(state["cyl_radius"]), "cyl", True),
+            ((state["cyl2_x"], state["cyl2_y"], state["cyl2_z"]),
+                float(state["cyl2_radius"]), "cyl2", True),
+        ]
+
+        candidates = []  # (t, name, center, world_r, is_cyl)
+        for center, world_r, name, is_cyl in objects:
+            pr = _pick_r(center, world_r)
+            t = (_ray_zcylinder(ro, rd, center, pr, float(CYL_HALF_H))
+                 if is_cyl else _ray_sphere(ro, rd, center, pr))
+            if t is not None and t > 1e-3:
+                candidates.append((t, name, center, world_r, is_cyl))
+
+        candidates.sort(key=lambda x: x[0])
+
+        if candidates:
+            dbg = "  ".join(f"{n}:t={t:.3f}" for t, n, *_ in candidates)
+        else:
+            dbg = "no hits"
+        print(f"[pick] click=({sx:.0f},{sy:.0f})  {dbg}", flush=True)
+
+        if not candidates:
+            # Plane fallback: project onto plane through plane_pt or camera center,
+            # perpendicular to ray direction (so the dot lands at the click depth).
+            ctr = np.array(cam.center, dtype=float)
+            ref = ctr if plane_pt is None else np.array(plane_pt, dtype=float)
+            t_plane = float(np.dot(ref - ro, rd))
+            return (ro + rd * t_plane, None) if t_plane > 0 else (None, None)
+
+        # Recompute the surface hit point with TRUE radius for the winning object
+        _, best_obj, best_center, best_r, best_is_cyl = candidates[0]
+        t_true = (_ray_zcylinder(ro, rd, best_center, best_r, float(CYL_HALF_H))
+                  if best_is_cyl else _ray_sphere(ro, rd, best_center, best_r))
+        t_final = t_true if (t_true is not None and t_true > 1e-3) else candidates[0][0]
+        return ro + rd * t_final, best_obj
+
+    _debug_dot = visuals.Markers(parent=view.scene)
+    _debug_dot.visible = False
+
+    # ── Keyboard: A / B to select, X / Y / Z to lock axis, D to deselect ──────
+
+    @canvas.events.key_press.connect
+    def _on_key_press(event):
+        k = event.key.name.lower() if hasattr(event.key, 'name') else str(event.key).lower()
+        # D = deselect; X/Y/Z = axis lock while held (for precise axis-aligned drag)
+        if k == 'd':
+            _sel["who"] = None;  _sel["axis_lock"] = None
+        elif k in ('x', 'y', 'z') and _sel["who"] is not None:
+            _sel["axis_lock"] = k.upper()
+        _refresh_gizmos()
+
+    @canvas.events.key_release.connect
+    def _on_key_release(event):
+        k = event.key.name.lower() if hasattr(event.key, 'name') else str(event.key).lower()
+        if k in ('x', 'y', 'z') and _sel["axis_lock"] == k.upper():
+            _sel["axis_lock"] = None
+            _refresh_gizmos()
+
+    # ── Mouse: click to project + spawn dot; select + drag ───────────────────────
+
+    def _on_sel_press(event):
+        if event.button != 1:
+            return
+
+        # Ray-geometry intersection: gives surface hit position AND object name
+        hit, geom_obj = _pick_world_pos(event.pos[0], event.pos[1])
+        if hit is not None:
+            print(f"[pick] px=({event.pos[0]:.0f},{event.pos[1]:.0f})"
+                  f"  world={np.round(hit, 3)}  obj={geom_obj!r}", flush=True)
+            _debug_dot.set_data(hit[np.newaxis].astype(np.float32),
+                                face_color=(1.0, 1.0, 1.0, 1.0), size=14, edge_width=0)
+            _debug_dot.visible = True
+
+        if geom_obj is not None:
+            # Hit a scene object → select it
+            _sel["who"]       = geom_obj
+            _sel["axis_lock"] = None
+            _refresh_gizmos()
+        else:
+            # Missed everything → deselect, let camera orbit
+            _sel["who"]       = None
+            _sel["axis_lock"] = None
+            _refresh_gizmos()
+            return   # don't block camera
+
+        # Only sensors are draggable for now; others just get selected
+        if _sel["who"] not in ("sensor_a", "sensor_b"):
+            event._blocked = True
+            return
+        _sel["dragging"]         = True
+        _sel["drag_start_world"] = _object_center(_sel["who"]).copy()
+        _sel["drag_start_mouse"] = np.array(event.pos[:2], dtype=float)
+        event._blocked = True
+
+    def _on_sel_move(event):
+        if not _sel["dragging"] or _sel["who"] is None:
+            return
+        d_screen = np.array(event.pos[:2], dtype=float) - _sel["drag_start_mouse"]
+        world_delta = _screen_delta_to_world(d_screen)
+        lock = _sel["axis_lock"]
+        if lock is not None:
+            ax_dir      = _AX_DIRS[lock]
+            world_delta = ax_dir * float(np.dot(world_delta, ax_dir))
+        new_pos = _sel["drag_start_world"] + world_delta
+
+        who = _sel["who"]
+        x, y, z = float(new_pos[0]), float(new_pos[1]), float(new_pos[2])
+        if who == "sensor_a":
+            state["sensor_a_x"] = x; state["sensor_a_y"] = y; state["sensor_a_z"] = z
+            _sphere_centers[0]  = new_pos
+            rebuild_scA()
+        elif who == "sensor_b":
+            state["sensor_b_x"] = x; state["sensor_b_y"] = y; state["sensor_b_z"] = z
+            _sphere_centers[1]  = new_pos
+            rebuild_scB()
+
+        _update_sensor_visuals()
+        _refresh_gizmos()
+        event._blocked = True
+
+    def _on_sel_release(event):
+        if _sel["dragging"]:
+            _sel["dragging"] = False
+            event._blocked   = True
+
+    canvas.events.mouse_press.connect(_on_sel_press,    position='first')
+    canvas.events.mouse_move.connect(_on_sel_move,      position='first')
+    canvas.events.mouse_release.connect(_on_sel_release, position='first')
+
     # ── Main tick ─────────────────────────────────────────────────────────────
     def on_timer(_event):
         try:
@@ -880,6 +1306,16 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                     elif key == "cyl2_enabled":
                         cyl2_vis.visible = bool(int(value))
                         _graph[0] = None
+                    elif key in ("sensor_a_x", "sensor_a_y", "sensor_a_z", "sensor_a_cyl_r"):
+                        rebuild_scA()
+                    elif key == "sensor_a_cyl_enabled":
+                        scA_vis.visible = bool(int(value))
+                        _graph[0] = None
+                    elif key in ("sensor_b_x", "sensor_b_y", "sensor_b_z", "sensor_b_cyl_r"):
+                        rebuild_scB()
+                    elif key == "sensor_b_cyl_enabled":
+                        scB_vis.visible = bool(int(value))
+                        _graph[0] = None
                     elif key == "particle_mass":
                         inv_mass_wp.assign(
                             wp.array(make_inv_mass(), dtype=float, device=device)
@@ -914,6 +1350,17 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         )
         _T_a   = shared[0];  _T_b  = shared[1]
         _theta = shared[2];  _pred = shared[3];  _resid = shared[4]
+        who  = _sel["who"]
+        lock = _sel["axis_lock"]
+        if who is not None:
+            pt       = _sphere_centers[0] if who == "A" else _sphere_centers[1]
+            ax_hint  = f" | holding {lock} axis" if lock else " | hold X/Y/Z to constrain axis"
+            drag_line = (
+                f"[Sensor {who} selected{ax_hint}]  "
+                f"X={pt[0]:+.3f}  Y={pt[1]:+.3f}  Z={pt[2]:+.3f}  — drag to move | D or A/B again to deselect"
+            )
+        else:
+            drag_line = "Press A or B to select sensor | D to deselect | orbit: left-drag"
         hud.text = (
             f"N={N}  seg={config.REST_LEN*1000:.1f}mm  r={state['ogc_r']:.3f}  "
             f"substeps={config.SUBSTEPS}  iter={config.CONSTRAINT_ITER}\n"
@@ -922,7 +1369,8 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
             f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
             f"T_A={_T_a:.2f}cN  T_B={_T_b:.2f}cN  "
-            f"θ={_theta:.1f}°  pred={_pred:.2f}cN  resid={_resid:.3f}"
+            f"θ={_theta:.1f}°  pred={_pred:.2f}cN  resid={_resid:.3f}\n"
+            f"{drag_line}"
         )
         canvas.update()
 
@@ -1118,13 +1566,37 @@ def run_ui(cmd_queue, shared):
     add_slider("Sensor A  X", "sensor_a_x", -3.0, 3.0, DEFAULTS["sensor_a_x"], fmt="{:+.3f}")
     add_slider("Sensor A  Y", "sensor_a_y", -3.0, 3.0, DEFAULTS["sensor_a_y"], fmt="{:+.3f}")
     add_slider("Sensor A  Z", "sensor_a_z", -3.0, 3.0, DEFAULTS["sensor_a_z"], fmt="{:+.3f}")
-    add_slider("Sensor A  radius (m)", "sensor_a_r", 0.01, 0.5, DEFAULTS["sensor_a_r"], fmt="{:.3f}")
+    add_slider("Sensor A  sphere radius (m)", "sensor_a_r", 0.01, 0.5, DEFAULTS["sensor_a_r"], fmt="{:.3f}")
+    _scA_en_var = tk.IntVar(value=DEFAULTS["sensor_a_cyl_enabled"])
+    _scA_en_frm = ttk.Frame(scroll_frm)
+    _scA_en_frm.pack(fill="x", padx=8, pady=3)
+    def _on_scA_toggle():
+        cmd_queue.put(("param", "sensor_a_cyl_enabled", _scA_en_var.get()))
+    ttk.Checkbutton(_scA_en_frm, text="Enable guide cylinder A (frictionless)",
+                    variable=_scA_en_var, command=_on_scA_toggle).pack(side="left")
+    param_vars["sensor_a_cyl_enabled"]      = _scA_en_var
+    param_callbacks["sensor_a_cyl_enabled"] = lambda v: (
+        _scA_en_var.set(int(v)), cmd_queue.put(("param", "sensor_a_cyl_enabled", int(v)))
+    )
+    add_slider("Sensor A  cylinder radius (m)", "sensor_a_cyl_r", 0.005, 0.3, DEFAULTS["sensor_a_cyl_r"], fmt="{:.3f}")
 
     section("Tension sensor B — downstream (green)")
     add_slider("Sensor B  X", "sensor_b_x", -3.0, 3.0, DEFAULTS["sensor_b_x"], fmt="{:+.3f}")
     add_slider("Sensor B  Y", "sensor_b_y", -3.0, 3.0, DEFAULTS["sensor_b_y"], fmt="{:+.3f}")
     add_slider("Sensor B  Z", "sensor_b_z", -3.0, 3.0, DEFAULTS["sensor_b_z"], fmt="{:+.3f}")
-    add_slider("Sensor B  radius (m)", "sensor_b_r", 0.01, 0.5, DEFAULTS["sensor_b_r"], fmt="{:.3f}")
+    add_slider("Sensor B  sphere radius (m)", "sensor_b_r", 0.01, 0.5, DEFAULTS["sensor_b_r"], fmt="{:.3f}")
+    _scB_en_var = tk.IntVar(value=DEFAULTS["sensor_b_cyl_enabled"])
+    _scB_en_frm = ttk.Frame(scroll_frm)
+    _scB_en_frm.pack(fill="x", padx=8, pady=3)
+    def _on_scB_toggle():
+        cmd_queue.put(("param", "sensor_b_cyl_enabled", _scB_en_var.get()))
+    ttk.Checkbutton(_scB_en_frm, text="Enable guide cylinder B (frictionless)",
+                    variable=_scB_en_var, command=_on_scB_toggle).pack(side="left")
+    param_vars["sensor_b_cyl_enabled"]      = _scB_en_var
+    param_callbacks["sensor_b_cyl_enabled"] = lambda v: (
+        _scB_en_var.set(int(v)), cmd_queue.put(("param", "sensor_b_cyl_enabled", int(v)))
+    )
+    add_slider("Sensor B  cylinder radius (m)", "sensor_b_cyl_r", 0.005, 0.3, DEFAULTS["sensor_b_cyl_r"], fmt="{:.3f}")
 
     section("Roll A — feeding roll (freely rotating)")
     add_slider("Roll A  X",       "roll_a_x",      -3.0,  3.0,  DEFAULTS["roll_a_x"],      fmt="{:+.3f}")
@@ -1268,7 +1740,7 @@ def run_ui(cmd_queue, shared):
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
     _GRAPH_HISTORY = 15      # seconds of rolling history to show
     _GRAPH_HZ      = 20      # update rate (Hz)
@@ -1306,6 +1778,21 @@ def run_ui(cmd_queue, shared):
     graph_canvas = FigureCanvasTkAgg(fig, master=graph_win)
     graph_canvas.get_tk_widget().pack(fill="both", expand=True)
 
+    # Matplotlib navigation toolbar — Home, Pan, Zoom-rect, Save, etc.
+    tool_frm = ttk.Frame(graph_win)
+    tool_frm.pack(fill="x")
+    graph_toolbar = NavigationToolbar2Tk(graph_canvas, tool_frm, pack_toolbar=False)
+    graph_toolbar.update()
+    graph_toolbar.pack(side="left")
+
+    # Auto-fit toggle — when off, the rolling auto-rescale is suspended so the
+    # user can inspect a frozen region.  Toggled OFF automatically the moment
+    # they zoom or pan; toggled back ON by clicking "Auto-fit" or "Home".
+    _auto_fit = tk.BooleanVar(value=True)
+    _auto_fit_chk = ttk.Checkbutton(tool_frm, text="Auto-fit",
+                                    variable=_auto_fit)
+    _auto_fit_chk.pack(side="left", padx=12)
+
     # Text panel below the plot for Capstan breakdown
     info_frm = ttk.Frame(graph_win)
     info_frm.pack(fill="x", padx=8, pady=4)
@@ -1316,6 +1803,36 @@ def run_ui(cmd_queue, shared):
 
     _last_sim_t  = [-1.0]
     _graph_alive = [True]
+
+    # When _update_graph adjusts the axes we set this flag so the limit-changed
+    # callbacks don't mistake it for a user action and disable auto-fit.
+    _programmatic_lim = [False]
+
+    def _on_user_axes_change(_ax):
+        if not _programmatic_lim[0]:
+            _auto_fit.set(False)
+
+    ax.callbacks.connect("xlim_changed", _on_user_axes_change)
+    ax.callbacks.connect("ylim_changed", _on_user_axes_change)
+
+    # Scroll-wheel zoom centred on the cursor position.  Ctrl+scroll = X only,
+    # Shift+scroll = Y only, otherwise both axes scale together.
+    def _on_scroll(event):
+        if event.inaxes is not ax:
+            return
+        scale = 1 / 1.2 if event.button == "up" else 1.2
+        x_only = bool(event.key and "control" in event.key)
+        y_only = bool(event.key and "shift"   in event.key)
+        xlo, xhi = ax.get_xlim();  ylo, yhi = ax.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        if not y_only:
+            ax.set_xlim(cx - (cx - xlo) * scale, cx + (xhi - cx) * scale)
+        if not x_only:
+            ax.set_ylim(cy - (cy - ylo) * scale, cy + (yhi - cy) * scale)
+        _auto_fit.set(False)
+        graph_canvas.draw_idle()
+
+    graph_canvas.mpl_connect("scroll_event", _on_scroll)
 
     def _clear_bufs():
         _t_buf.clear();  _Ta_buf.clear();  _Tb_buf.clear()
@@ -1345,11 +1862,14 @@ def run_ui(cmd_queue, shared):
 
             line_a.set_data(t_arr, ta_arr)
             line_b.set_data(t_arr, tb_arr)
-            ax.set_xlim(max(0.0, t_lo), max(t_now, _GRAPH_HISTORY))
-            all_vals = ta_arr + tb_arr
-            v_min = min(all_vals);  v_max = max(all_vals)
-            pad   = max(0.5, (v_max - v_min) * 0.15)
-            ax.set_ylim(v_min - pad, v_max + pad)
+            if _auto_fit.get():
+                _programmatic_lim[0] = True
+                ax.set_xlim(max(0.0, t_lo), max(t_now, _GRAPH_HISTORY))
+                all_vals = ta_arr + tb_arr
+                v_min = min(all_vals);  v_max = max(all_vals)
+                pad   = max(0.5, (v_max - v_min) * 0.15)
+                ax.set_ylim(v_min - pad, v_max + pad)
+                _programmatic_lim[0] = False
             graph_canvas.draw_idle()
 
         T_a    = shared[0];  T_b   = shared[1]
