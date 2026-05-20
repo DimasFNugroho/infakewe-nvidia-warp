@@ -27,6 +27,35 @@ import sys
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# ── Wrap-angle debug shared buffer ───────────────────────────────────────────
+# Layout (all doubles):
+#   [0]  n_search       — particles in search region (count, capped at MAX)
+#   [1]  cx             — cylinder centre X (world)
+#   [2]  cy             — cylinder centre Y (world)
+#   [3]  r_cyl          — cylinder radius
+#   [4]  r_contact      — r_cyl + ogc_r
+#   [5]  arc_tol        — arc-band half-thickness
+#   [6]  rd             — search radius
+#   [7]  theta_rad      — computed wrap angle (rad)
+#   [8]  n_arc          — count of arc particles
+#   [9]  longest_len    — length of longest contiguous run
+#   [10] refined_in_x   — refined in-tangent point (relative to cyl centre), NaN if none
+#   [11] refined_in_y
+#   [12] refined_out_x  — refined out-tangent point
+#   [13] refined_out_y
+#   [14] sim_t          — sim time when written
+#   [15] signed_theta   — signed Σ Δθ (rad) before abs (drives sweep direction)
+#   [16..23] reserved
+# Per-particle body, starting at offset 24, stride 4:
+#   [+0] x (relative to cyl centre)
+#   [+1] y
+#   [+2] r (distance to axis)
+#   [+3] cls (0=search-only, 1=in-longest-run, 2=arc)
+MAX_DEBUG_PARTS = 512
+DBG_HEADER_LEN  = 24
+DBG_STRIDE      = 4
+DBG_ARRAY_LEN   = DBG_HEADER_LEN + DBG_STRIDE * MAX_DEBUG_PARTS
+
 
 # ── Shared parameter defaults ─────────────────────────────────────────────────
 
@@ -65,12 +94,21 @@ DEFAULTS = {
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
     # Tension sensor A (upstream, yellow) — place on Roll-A side of guide
     "sensor_a_x":  -0.30,  "sensor_a_y":  0.10,  "sensor_a_z":  0.00,
-    "sensor_a_r":   0.05,   # detection sphere radius
+    # Detection volume = axis-aligned box.  Half-extents along each axis (m).
+    # Defaults form an upright plate: 10 cm × 10 cm × 1 cm (thin in Z), oriented
+    # so the yarn travelling in the XY plane passes broadside through the plate.
+    "sensor_a_hx":  0.05,
+    "sensor_a_hy":  0.05,
+    "sensor_a_hz":  0.005,
+    "sensor_a_alpha": 0.40,        # box visualization opacity, 0..1
     "sensor_a_cyl_r":    0.03,   # physical frictionless cylinder radius
     "sensor_a_cyl_enabled": 0,
     # Tension sensor B (downstream, green) — place on Roll-B side of guide
     "sensor_b_x":   0.20,  "sensor_b_y": -0.10,  "sensor_b_z":  0.20,
-    "sensor_b_r":   0.05,   # detection sphere radius
+    "sensor_b_hx":  0.05,
+    "sensor_b_hy":  0.05,
+    "sensor_b_hz":  0.005,
+    "sensor_b_alpha": 0.40,
     "sensor_b_cyl_r":    0.03,   # physical frictionless cylinder radius
     "sensor_b_cyl_enabled": 0,
     # Self-collision
@@ -84,18 +122,14 @@ DEFAULTS = {
     "cyl_y":            -0.32444444444444454,
     "cyl_z":            -0.03111111111111109,
     "cyl_radius":        0.08,
-    # Frictionless guide cylinder (redirects yarn, no friction)
-    "cyl2_x":            0.0,
-    "cyl2_y":            0.0,
-    "cyl2_z":            0.3,
-    "cyl2_radius":       0.05,
-    "cyl2_enabled":      0,     # 0 = off, 1 = on
+    "cyl_detect_r":      0.20,   # detection radius for wrap-angle estimation (m)
+    "cyl_detect_show":   0,      # 0 = hide detection volume, 1 = show
 }
 
 
 # ── Simulation worker process ─────────────────────────────────────────────────
 
-def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
+def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     """Run Warp + OGC (3 obstacles) + vispy in a dedicated process."""
     sys.path.insert(0, os.path.join(script_dir, ".."))
     sys.path.insert(0, script_dir)
@@ -140,7 +174,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     ROLL_A_COL = (0.20, 0.50, 0.90, 0.80)   # blue  — feeding roll
     ROLL_B_COL = (0.90, 0.45, 0.10, 0.80)   # orange — pulling roll
     CYL_COL    = (0.25, 0.70, 0.45, 0.75)   # green  — guide cylinder
-    CYL2_COL   = (0.85, 0.85, 0.85, 0.60)   # light grey — frictionless guide
+    CYL_DET_COL = (0.50, 0.70, 0.95, 0.15)   # light blue, very translucent — wrap-detect volume
     ANCHOR_COL = (0.0,  0.83, 1.0)           # cyan marker — particle 0
     PULL_COL   = (1.0,  0.65, 0.0)           # amber marker — particle N-1
 
@@ -280,14 +314,12 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     mesh_a    = _cyl("roll_a_x",    "roll_a_y",    "roll_a_z",    "roll_a_radius")
     mesh_b    = _cyl("roll_b_x",    "roll_b_y",    "roll_b_z",    "roll_b_radius")
     mesh_mid  = _cyl("cyl_x",       "cyl_y",       "cyl_z",       "cyl_radius")
-    mesh_cyl2 = _cyl("cyl2_x",      "cyl2_y",      "cyl2_z",      "cyl2_radius")
     mesh_scA  = _cyl("sensor_a_x",  "sensor_a_y",  "sensor_a_z",  "sensor_a_cyl_r")
     mesh_scB  = _cyl("sensor_b_x",  "sensor_b_y",  "sensor_b_z",  "sensor_b_cyl_r")
 
     obs_a    = ObstacleGPU(mesh_a,   device)
     obs_b    = ObstacleGPU(mesh_b,   device)
     obs_mid  = ObstacleGPU(mesh_mid, device)
-    obs_cyl2 = ObstacleGPU(mesh_cyl2, device)
     obs_scA  = ObstacleGPU(mesh_scA,  device)
     obs_scB  = ObstacleGPU(mesh_scB,  device)
 
@@ -315,7 +347,6 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     vf_a    = VFContacts(N, device);   ee_a    = EEContacts(N - 1, device)
     vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
     vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
-    vf_cyl2 = VFContacts(N, device);   ee_cyl2 = EEContacts(N - 1, device)
     vf_scA  = VFContacts(N, device);   ee_scA  = EEContacts(N - 1, device)
     vf_scB  = VFContacts(N, device);   ee_scB  = EEContacts(N - 1, device)
 
@@ -336,7 +367,6 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         [obs_mid, vf_mid, ee_mid],
     ]
     frictionless_contacts = [
-        [obs_cyl2, vf_cyl2, ee_cyl2, "cyl2_enabled"],
         [obs_scA,  vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
         [obs_scB,  vf_scB,  ee_scB,  "sensor_b_cyl_enabled"],
     ]
@@ -351,7 +381,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
-        nonlocal vf_cyl2, ee_cyl2, vf_scA, ee_scA, vf_scB, ee_scB, frictionless_contacts
+        nonlocal vf_scA, ee_scA, vf_scB, ee_scB, frictionless_contacts
         nonlocal yarn_colors, pos_det_wp, max_disp_buf
 
         N = max(4, new_N)
@@ -379,7 +409,6 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         vf_a    = VFContacts(N, device);   ee_a    = EEContacts(N - 1, device)
         vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
         vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
-        vf_cyl2 = VFContacts(N, device);   ee_cyl2 = EEContacts(N - 1, device)
         vf_scA  = VFContacts(N, device);   ee_scA  = EEContacts(N - 1, device)
         vf_scB  = VFContacts(N, device);   ee_scB  = EEContacts(N - 1, device)
         self_ee = SelfEEContacts(N - 1, device)
@@ -390,9 +419,8 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             [contacts[2][0], vf_mid, ee_mid],
         ]
         frictionless_contacts = [
-            [frictionless_contacts[0][0], vf_cyl2, ee_cyl2, "cyl2_enabled"],
-            [frictionless_contacts[1][0], vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
-            [frictionless_contacts[2][0], vf_scB,  ee_scB,  "sensor_b_cyl_enabled"],
+            [frictionless_contacts[0][0], vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
+            [frictionless_contacts[1][0], vf_scB,  ee_scB,  "sensor_b_cyl_enabled"],
         ]
 
         pos_det_wp   = wp.zeros(N, dtype=wp.vec3, device=device)
@@ -505,15 +533,190 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         T_N = mass * stiff * float(np.mean(exts)) / (sub_dt_ref ** 2)
         return T_N * 100.0   # → centi-Newtons
 
-    def _wrap_angle(pp, sc_a, sc_b):
-        """Wrap angle θ (rad) between the two sensor sphere centres around guide."""
-        cx = float(state["cyl_x"]);  cz = float(state["cyl_z"])
-        va = np.array([sc_a[0] - cx, sc_a[2] - cz])
-        vb = np.array([sc_b[0] - cx, sc_b[2] - cz])
-        na = np.linalg.norm(va);  nb = np.linalg.norm(vb)
-        if na < 1e-9 or nb < 1e-9:
-            return 0.0
-        return float(np.arccos(np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0)))
+    def _wrap_angle_contacts(pp, dbg=None):
+        """Wrap angle θ (rad) by fitting the yarn arc around the guide cylinder.
+
+        Geometric idea: only the part of the yarn that actually wraps the guide
+        is at the contact distance r_c = cyl_radius + ogc_r from the axis.  The
+        tangent straight segments leading INTO and OUT of the wrap are *farther*
+        from the axis and curve outward.  We therefore separate two roles:
+
+          • `cyl_detect_r` defines a WIDE search region around the guide — just
+            to locate yarn particles near it (with hysteresis-friendly margin).
+          • A SECOND, narrow band at distance ≈ r_c selects which of those
+            particles actually lie on the wrap arc.
+
+        Algorithm:
+          1. Search: collect all particles within `cyl_detect_r` of the axis
+             (XY plane) and within the cylinder's Z range.
+          2. Run isolation: among them, take the longest contiguous yarn-index
+             run — that's the segment that traverses the guide.
+          3. Arc filter: from that run keep only particles whose XY distance to
+             axis lies in [r_c − tol, r_c + tol].  Straight tangents are
+             excluded because their distance grows linearly away from r_c.
+          4. Integrate: |Σ Δθ| (with ±π unwrap) over the arc particles only.
+
+        The result is invariant to `cyl_detect_r` as long as it exceeds
+        r_c + tol — only the arc particles contribute, regardless of how big
+        the search region is.
+
+        Returns (theta_rad, n_arc).
+        """
+        cx = float(state["cyl_x"])
+        cy = float(state["cyl_y"])
+        cz = float(state["cyl_z"])
+        r_cyl = float(state["cyl_radius"])
+        ogc_r = float(state.get("ogc_r", 0.005))
+        rd    = float(state.get("cyl_detect_r", 0.20))
+
+        dx = pp[:, 0] - cx
+        dy = pp[:, 1] - cy
+        dist_xy = np.sqrt(dx * dx + dy * dy)
+        in_z = np.abs(pp[:, 2] - cz) < CYL_HALF_H
+
+        # Step 1: search volume
+        in_search = (dist_xy < rd) & in_z
+        idxs = np.where(in_search)[0]
+
+        r_contact = r_cyl + ogc_r
+        arc_tol = max(3.0 * ogc_r, 0.05 * r_cyl)
+
+        if dbg is not None:
+            # Cap for the shared-memory transport
+            sel = idxs[:MAX_DEBUG_PARTS]
+            dbg["cx"]        = float(cx)
+            dbg["cy"]        = float(cy)
+            dbg["r_cyl"]     = float(r_cyl)
+            dbg["r_contact"] = float(r_contact)
+            dbg["arc_tol"]   = float(arc_tol)
+            dbg["rd"]        = float(rd)
+            dbg["idxs"]      = np.asarray(sel, dtype=np.int32)
+            dbg["xs"]        = dx[sel].astype(np.float64)
+            dbg["ys"]        = dy[sel].astype(np.float64)
+            dbg["rs"]        = dist_xy[sel].astype(np.float64)
+            dbg["cls"]       = np.zeros(len(sel), dtype=np.int32)
+            dbg["longest_len"] = 0
+            dbg["n_arc"]     = 0
+            dbg["refined_in_xy"]  = None
+            dbg["refined_out_xy"] = None
+
+        if len(idxs) < 2:
+            return 0.0, int(len(idxs))
+
+        # Step 2: longest contiguous run of yarn indices
+        runs = []
+        cur = [int(idxs[0])]
+        for i in idxs[1:]:
+            i = int(i)
+            if i == cur[-1] + 1:
+                cur.append(i)
+            else:
+                runs.append(cur)
+                cur = [i]
+        runs.append(cur)
+        longest = np.asarray(max(runs, key=len), dtype=int)
+
+        if dbg is not None:
+            dbg["longest_len"] = int(len(longest))
+            # Upgrade cls=1 for any debug particle that's part of the longest run
+            longest_set = set(int(i) for i in longest)
+            sel_idxs = dbg["idxs"]
+            for k, i in enumerate(sel_idxs):
+                if int(i) in longest_set:
+                    dbg["cls"][k] = 1
+
+        if len(longest) < 2:
+            return 0.0, int(len(longest))
+
+        # Step 3: arc filter — distance ≈ contact radius
+        # Tolerance: thick enough to absorb numerical jitter at the OGC
+        # equilibrium distance, thin enough to exclude tangent segments that
+        # curve away from the cylinder.
+        arc_mask = (dist_xy[longest] >= r_contact - arc_tol) & \
+                   (dist_xy[longest] <= r_contact + arc_tol)
+        arc_idxs = longest[arc_mask]
+
+        if dbg is not None:
+            dbg["n_arc"] = int(len(arc_idxs))
+            arc_set = set(int(i) for i in arc_idxs)
+            sel_idxs = dbg["idxs"]
+            for k, i in enumerate(sel_idxs):
+                if int(i) in arc_set:
+                    dbg["cls"][k] = 2
+
+        if len(arc_idxs) < 2:
+            return 0.0, int(len(arc_idxs))
+
+        # Step 4: angles of arc particles around the cylinder axis (XY plane).
+        angles = np.arctan2(dy[arc_idxs], dx[arc_idxs]).astype(float).copy()
+
+        # Step 5: refine the boundary angles by intersecting the segment
+        # (arc-boundary particle ↔ its out-of-band yarn neighbor) with the
+        # contact circle r = r_contact.  That intersection is the true tangent
+        # point regardless of whether the boundary particle is on the tangent
+        # line (R > r_c) or already on the arc with small jitter (R ≈ r_c) —
+        # we don't have to guess.  Solving
+        #   |(1−t)·p_neighbor + t·p_boundary|² = r_contact²
+        # gives a quadratic in t; we pick the root nearest to the arc end of
+        # the segment, which is the physically-correct crossing.
+        def _refine(i_bdy, i_nbr):
+            if i_nbr < 0 or i_nbr >= len(pp):
+                return None
+            xn = float(pp[i_nbr, 0]) - cx
+            yn = float(pp[i_nbr, 1]) - cy
+            xb = float(dx[i_bdy])
+            yb = float(dy[i_bdy])
+            vx = xb - xn;  vy = yb - yn
+            A = vx * vx + vy * vy
+            if A < 1e-12:
+                return None
+            B = 2.0 * (xn * vx + yn * vy)
+            C = xn * xn + yn * yn - r_contact * r_contact
+            disc = B * B - 4.0 * A * C
+            if disc < 0.0:
+                return None       # line doesn't cross the contact circle
+            sq = float(np.sqrt(disc))
+            t1 = (-B - sq) / (2.0 * A)
+            t2 = (-B + sq) / (2.0 * A)
+            # Prefer the root in (0, 1] (between neighbor and boundary); if
+            # neither fits, allow modest extrapolation toward the boundary
+            # (t slightly > 1) to handle the case where both particles are
+            # just above the contact circle.
+            candidates = sorted([t1, t2], key=lambda v: abs(v - 1.0))
+            for t in candidates:
+                if -0.1 <= t <= 1.3:
+                    xt = xn + t * vx
+                    yt = yn + t * vy
+                    return float(np.arctan2(yt, xt))
+            return None
+
+        new_in  = _refine(int(arc_idxs[0]),  int(arc_idxs[0])  - 1)
+        new_out = _refine(int(arc_idxs[-1]), int(arc_idxs[-1]) + 1)
+        if new_in  is not None:
+            angles[0]  = new_in
+        if new_out is not None:
+            angles[-1] = new_out
+
+        if dbg is not None:
+            if new_in is not None:
+                dbg["refined_in_xy"]  = (float(r_contact * np.cos(new_in)),
+                                         float(r_contact * np.sin(new_in)))
+            if new_out is not None:
+                dbg["refined_out_xy"] = (float(r_contact * np.cos(new_out)),
+                                         float(r_contact * np.sin(new_out)))
+
+        # Step 6: signed Δθ sum with ±π unwrap → robust net rotation
+        dth = np.diff(angles)
+        dth = (dth + np.pi) % (2.0 * np.pi) - np.pi
+        signed = float(np.sum(dth))
+        wrap = float(abs(signed))
+        if dbg is not None:
+            dbg["signed_theta"] = signed
+            # Keep the post-refinement arc-particle azimuths so the viz can
+            # draw a radial tick at each one — that's the discrete sampling
+            # the algorithm sums Δθ across.
+            dbg["arc_angles"] = angles.copy()
+        return wrap, int(len(arc_idxs))
 
     def _write_shared(pp, sim_t):
         """Compute tension via detection spheres, then Capstan metrics → shared[]."""
@@ -526,22 +729,59 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         _sphere_centers[0] = sc_a
         _sphere_centers[1] = sc_b
 
-        mask_a = np.linalg.norm(pp - sc_a, axis=1) < float(state["sensor_a_r"])
-        mask_b = np.linalg.norm(pp - sc_b, axis=1) < float(state["sensor_b_r"])
+        # Box-shaped detection volume: particle inside the AABB centred on sc.
+        ha = (float(state["sensor_a_hx"]), float(state["sensor_a_hy"]), float(state["sensor_a_hz"]))
+        hb = (float(state["sensor_b_hx"]), float(state["sensor_b_hy"]), float(state["sensor_b_hz"]))
+        da = np.abs(pp - sc_a);  db = np.abs(pp - sc_b)
+        mask_a = (da[:, 0] < ha[0]) & (da[:, 1] < ha[1]) & (da[:, 2] < ha[2])
+        mask_b = (db[:, 0] < hb[0]) & (db[:, 1] < hb[1]) & (db[:, 2] < hb[2])
 
         T_a   = _tension_from_mask(pp, mask_a)
         T_b   = _tension_from_mask(pp, mask_b)
-        theta = _wrap_angle(pp, sc_a, sc_b)
+        dbg   = {}
+        theta, n_contact = _wrap_angle_contacts(pp, dbg=dbg)
         mu_k  = float(state["mu_kinetic"])
         capstan_pred = T_a * np.exp(mu_k * theta)
         residual     = (T_b / capstan_pred) if capstan_pred > 1e-9 else 0.0
-        # shared layout: [T_a, T_b, theta_deg, capstan_pred, residual, sim_time]
+        # shared layout: [T_a, T_b, theta_deg, capstan_pred, residual, sim_time, n_contact]
         shared[0] = T_a
         shared[1] = T_b
         shared[2] = float(np.degrees(theta))
         shared[3] = capstan_pred
         shared[4] = residual
         shared[5] = sim_t
+        shared[6] = float(n_contact)
+
+        # Wrap-angle debug snapshot for the live 2D viz.
+        n_dbg = int(len(dbg.get("xs", [])))
+        dbg_shared[0]  = float(n_dbg)
+        dbg_shared[1]  = float(dbg.get("cx", 0.0))
+        dbg_shared[2]  = float(dbg.get("cy", 0.0))
+        dbg_shared[3]  = float(dbg.get("r_cyl", 0.0))
+        dbg_shared[4]  = float(dbg.get("r_contact", 0.0))
+        dbg_shared[5]  = float(dbg.get("arc_tol", 0.0))
+        dbg_shared[6]  = float(dbg.get("rd", 0.0))
+        dbg_shared[7]  = float(theta)
+        dbg_shared[8]  = float(n_contact)
+        dbg_shared[9]  = float(dbg.get("longest_len", 0))
+        rin  = dbg.get("refined_in_xy")
+        rout = dbg.get("refined_out_xy")
+        nan  = float("nan")
+        dbg_shared[10] = rin[0]  if rin  else nan
+        dbg_shared[11] = rin[1]  if rin  else nan
+        dbg_shared[12] = rout[0] if rout else nan
+        dbg_shared[13] = rout[1] if rout else nan
+        dbg_shared[14] = float(sim_t)
+        dbg_shared[15] = float(dbg.get("signed_theta", 0.0))
+        if n_dbg > 0:
+            xs  = dbg["xs"];  ys = dbg["ys"];  rs = dbg["rs"];  cls = dbg["cls"]
+            base = DBG_HEADER_LEN
+            for k in range(n_dbg):
+                off = base + DBG_STRIDE * k
+                dbg_shared[off + 0] = float(xs[k])
+                dbg_shared[off + 1] = float(ys[k])
+                dbg_shared[off + 2] = float(rs[k])
+                dbg_shared[off + 3] = float(cls[k])
 
     def _execute_substeps():
         """One full frame of substeps — graph-capture-safe.
@@ -739,7 +979,6 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     va,   fa   = mesh_for_render(mesh_a)
     vb,   fb   = mesh_for_render(mesh_b)
     vm,   fm   = mesh_for_render(mesh_mid)
-    vc2,  fc2  = mesh_for_render(mesh_cyl2)
     vsA,  fsA  = mesh_for_render(mesh_scA)
     vsB,  fsB  = mesh_for_render(mesh_scB)
 
@@ -750,13 +989,20 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     roll_a_vis  = visuals.Mesh(vertices=va,  faces=fa,  color=ROLL_A_COL,  shading="smooth", parent=view.scene)
     roll_b_vis  = visuals.Mesh(vertices=vb,  faces=fb,  color=ROLL_B_COL,  shading="smooth", parent=view.scene)
     cyl_vis     = visuals.Mesh(vertices=vm,  faces=fm,  color=CYL_COL,     shading="smooth", parent=view.scene)
-    cyl2_vis    = visuals.Mesh(vertices=vc2, faces=fc2, color=CYL2_COL,    shading="smooth", parent=view.scene)
     scA_vis     = visuals.Mesh(vertices=vsA, faces=fsA, color=SCY_A_COL,   shading="smooth", parent=view.scene)
     scB_vis     = visuals.Mesh(vertices=vsB, faces=fsB, color=SCY_B_COL,   shading="smooth", parent=view.scene)
-    cyl2_vis.set_gl_state("translucent", depth_test=True)
-    cyl2_vis.visible = bool(int(state.get("cyl2_enabled", 0)))
     scA_vis.visible  = bool(int(state.get("sensor_a_cyl_enabled", 0)))
     scB_vis.visible  = bool(int(state.get("sensor_b_cyl_enabled", 0)))
+
+    # Wrap-angle detection volume: a translucent cylinder of radius cyl_detect_r
+    # around the guide.  Yarn particles inside this volume are summed into θ.
+    # Hidden by default — toggle via the "Show wrap-detect volume" checkbox.
+    mesh_detect = _cyl("cyl_x", "cyl_y", "cyl_z", "cyl_detect_r")
+    vd, fd = mesh_for_render(mesh_detect)
+    cyl_detect_vis = visuals.Mesh(vertices=vd, faces=fd, color=CYL_DET_COL,
+                                  shading="smooth", parent=view.scene)
+    cyl_detect_vis.set_gl_state("translucent", depth_test=True)
+    cyl_detect_vis.visible = bool(int(state.get("cyl_detect_show", 0)))
 
     p = pos_wp.numpy()
     yarn_colors = make_yarn_colors(N)
@@ -767,32 +1013,47 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     marker_a.set_data(p[:1],  face_color=ANCHOR_COL, size=14, edge_width=0)
     marker_b.set_data(p[-1:], face_color=PULL_COL,   size=14, edge_width=0)
 
-    # Tension sensor spheres: proper 3D meshes that scale with the scene.
-    # Unit sphere vertices are generated once; each frame we scale+translate
-    # them in numpy — no vispy transform API required, works across versions.
-    from vispy.geometry import create_sphere
-
+    # Tension sensor boxes: axis-aligned plates whose half-extents in X, Y, Z
+    # are user-tunable.  The detection mask is a point-in-AABB test using the
+    # same half-extents, so the rendered volume matches what's being measured.
     _sc_a0 = np.array([DEFAULTS["sensor_a_x"], DEFAULTS["sensor_a_y"], DEFAULTS["sensor_a_z"]], dtype=np.float32)
     _sc_b0 = np.array([DEFAULTS["sensor_b_x"], DEFAULTS["sensor_b_y"], DEFAULTS["sensor_b_z"]], dtype=np.float32)
     _sphere_centers[0] = _sc_a0;  _sphere_centers[1] = _sc_b0
 
-    _sphere_md    = create_sphere(radius=1.0, cols=24, rows=24)
-    _unit_verts   = _sphere_md.get_vertices()          # (V, 3) unit sphere
-    _sphere_faces = _sphere_md.get_faces()             # (F, 3) indices, shared
+    # Cube face triangulation (shared between both sensors).
+    _BOX_FACES = np.array([
+        # -Y, +Y
+        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+        # -Z, +Z
+        [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2],
+        # -X, +X
+        [0, 4, 7], [0, 7, 3], [1, 2, 6], [1, 6, 5],
+    ], dtype=np.uint32)
 
-    def _sphere_verts(center, radius):
-        return (_unit_verts * radius + center).astype(np.float32)
+    def _box_verts(center, hx, hy, hz):
+        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        return np.array([
+            [cx-hx, cy-hy, cz-hz], [cx+hx, cy-hy, cz-hz],
+            [cx+hx, cy-hy, cz+hz], [cx-hx, cy-hy, cz+hz],
+            [cx-hx, cy+hy, cz-hz], [cx+hx, cy+hy, cz-hz],
+            [cx+hx, cy+hy, cz+hz], [cx-hx, cy+hy, cz+hz],
+        ], dtype=np.float32)
 
-    sensor_sphere_a = visuals.Mesh(
-        vertices=_sphere_verts(_sc_a0, DEFAULTS["sensor_a_r"]),
-        faces=_sphere_faces,
-        color=(1.0, 0.85, 0.0, 0.45), shading="smooth", parent=view.scene)
-    sensor_sphere_b = visuals.Mesh(
-        vertices=_sphere_verts(_sc_b0, DEFAULTS["sensor_b_r"]),
-        faces=_sphere_faces,
-        color=(0.0, 0.85, 0.25, 0.45), shading="smooth", parent=view.scene)
-    sensor_sphere_a.set_gl_state("translucent", depth_test=True)
-    sensor_sphere_b.set_gl_state("translucent", depth_test=True)
+    _SENSOR_A_RGB = (1.0, 0.85, 0.0)
+    _SENSOR_B_RGB = (0.0, 0.85, 0.25)
+
+    sensor_box_a = visuals.Mesh(
+        vertices=_box_verts(_sc_a0, DEFAULTS["sensor_a_hx"], DEFAULTS["sensor_a_hy"], DEFAULTS["sensor_a_hz"]),
+        faces=_BOX_FACES,
+        color=_SENSOR_A_RGB + (DEFAULTS["sensor_a_alpha"],),
+        shading="smooth", parent=view.scene)
+    sensor_box_b = visuals.Mesh(
+        vertices=_box_verts(_sc_b0, DEFAULTS["sensor_b_hx"], DEFAULTS["sensor_b_hy"], DEFAULTS["sensor_b_hz"]),
+        faces=_BOX_FACES,
+        color=_SENSOR_B_RGB + (DEFAULTS["sensor_b_alpha"],),
+        shading="smooth", parent=view.scene)
+    sensor_box_a.set_gl_state("translucent", depth_test=True)
+    sensor_box_b.set_gl_state("translucent", depth_test=True)
 
     # Small opaque centre dots — visible through the transparent mesh.
     sensor_dot_a = visuals.Markers(parent=view.scene)
@@ -801,10 +1062,19 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
     sensor_dot_b.set_data(_sc_b0[np.newaxis], face_color=(0.0, 0.9, 0.3, 1.0), size=7, edge_width=0)
 
     def _update_sensor_visuals():
-        sa = _sphere_centers[0];  ra = float(state.get("sensor_a_r", 0.05))
-        sb = _sphere_centers[1];  rb = float(state.get("sensor_b_r", 0.05))
-        sensor_sphere_a.set_data(vertices=_sphere_verts(sa, ra), faces=_sphere_faces)
-        sensor_sphere_b.set_data(vertices=_sphere_verts(sb, rb), faces=_sphere_faces)
+        sa = _sphere_centers[0];  sb = _sphere_centers[1]
+        ha = (float(state.get("sensor_a_hx", 0.05)),
+              float(state.get("sensor_a_hy", 0.005)),
+              float(state.get("sensor_a_hz", 0.05)))
+        hb = (float(state.get("sensor_b_hx", 0.05)),
+              float(state.get("sensor_b_hy", 0.005)),
+              float(state.get("sensor_b_hz", 0.05)))
+        aa = float(np.clip(state.get("sensor_a_alpha", 0.4), 0.0, 1.0))
+        ab = float(np.clip(state.get("sensor_b_alpha", 0.4), 0.0, 1.0))
+        sensor_box_a.set_data(vertices=_box_verts(sa, *ha), faces=_BOX_FACES,
+                              color=_SENSOR_A_RGB + (aa,))
+        sensor_box_b.set_data(vertices=_box_verts(sb, *hb), faces=_BOX_FACES,
+                              color=_SENSOR_B_RGB + (ab,))
         sensor_dot_a.set_data(np.array([sa], dtype=np.float32),
                               face_color=(1.0, 0.9, 0.0, 1.0), size=7, edge_width=0)
         sensor_dot_b.set_data(np.array([sb], dtype=np.float32),
@@ -852,23 +1122,22 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         cyl_vis.set_data(vertices=vv, faces=ff, color=CYL_COL)
         _graph[0] = None
 
-    def rebuild_cyl2():
-        new_mesh = _cyl("cyl2_x", "cyl2_y", "cyl2_z", "cyl2_radius")
-        frictionless_contacts[0][0] = ObstacleGPU(new_mesh, device)
+    def rebuild_detect_vol():
+        """Refresh the wrap-angle detection cylinder (visual only; no physics)."""
+        new_mesh = _cyl("cyl_x", "cyl_y", "cyl_z", "cyl_detect_r")
         vv, ff = mesh_for_render(new_mesh)
-        cyl2_vis.set_data(vertices=vv, faces=ff, color=CYL2_COL)
-        _graph[0] = None
+        cyl_detect_vis.set_data(vertices=vv, faces=ff, color=CYL_DET_COL)
 
     def rebuild_scA():
         new_mesh = _cyl("sensor_a_x", "sensor_a_y", "sensor_a_z", "sensor_a_cyl_r")
-        frictionless_contacts[1][0] = ObstacleGPU(new_mesh, device)
+        frictionless_contacts[0][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         scA_vis.set_data(vertices=vv, faces=ff, color=SCY_A_COL)
         _graph[0] = None
 
     def rebuild_scB():
         new_mesh = _cyl("sensor_b_x", "sensor_b_y", "sensor_b_z", "sensor_b_cyl_r")
-        frictionless_contacts[2][0] = ObstacleGPU(new_mesh, device)
+        frictionless_contacts[1][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         scB_vis.set_data(vertices=vv, faces=ff, color=SCY_B_COL)
         _graph[0] = None
@@ -916,7 +1185,6 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             "roll_a": ("roll_a_x", "roll_a_y", "roll_a_z"),
             "roll_b": ("roll_b_x", "roll_b_y", "roll_b_z"),
             "cyl":    ("cyl_x",    "cyl_y",    "cyl_z"),
-            "cyl2":   ("cyl2_x",   "cyl2_y",   "cyl2_z"),
         }
         kx, ky, kz = key_map[who]
         return np.array([state[kx], state[ky], state[kz]], dtype=float)
@@ -996,6 +1264,33 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         if t < 1e-4:
             t = (-b + sq) / 2.0
         return t if t > 1e-4 else None
+
+    def _ray_aabb(ro, rd, center, hx, hy, hz):
+        """Return smallest positive t for ray vs axis-aligned box, or None.
+
+        Standard slab method.  center is (cx, cy, cz); the box spans
+        [cx-hx, cx+hx] × [cy-hy, cy+hy] × [cz-hz, cz+hz].
+        """
+        mins = (center[0] - hx, center[1] - hy, center[2] - hz)
+        maxs = (center[0] + hx, center[1] + hy, center[2] + hz)
+        t_lo, t_hi = -1.0e30, 1.0e30
+        for i in range(3):
+            if abs(rd[i]) < 1.0e-12:
+                if ro[i] < mins[i] or ro[i] > maxs[i]:
+                    return None
+                continue
+            inv = 1.0 / rd[i]
+            t1 = (mins[i] - ro[i]) * inv
+            t2 = (maxs[i] - ro[i]) * inv
+            if t1 > t2:
+                t1, t2 = t2, t1
+            if t1 > t_lo:
+                t_lo = t1
+            if t2 < t_hi:
+                t_hi = t2
+        if t_hi < t_lo or t_hi < 1.0e-4:
+            return None
+        return t_lo if t_lo > 1.0e-4 else t_hi
 
     def _ray_zcylinder(ro, rd, center, radius, half_h):
         """Return smallest positive t for ray against a Z-aligned capped cylinder,
@@ -1126,27 +1421,40 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             one_px = max(dist * 2.0 * half_tan / ch, 1e-6)
             return max(_MIN_HIT_PX * one_px, world_r)
 
-        # All pickable objects: (center, physical_r, name, is_cylinder)
+        # All pickable objects: (center, geom_data, name, shape)
+        #   shape == "box"   → geom_data = (hx, hy, hz)
+        #   shape == "cyl"   → geom_data = world_r (scalar)
+        sa_hs = (float(state.get("sensor_a_hx", 0.05)),
+                 float(state.get("sensor_a_hy", 0.005)),
+                 float(state.get("sensor_a_hz", 0.05)))
+        sb_hs = (float(state.get("sensor_b_hx", 0.05)),
+                 float(state.get("sensor_b_hy", 0.005)),
+                 float(state.get("sensor_b_hz", 0.05)))
         objects = [
-            (tuple(_sphere_centers[0]), float(state.get("sensor_a_r", 0.05)), "sensor_a", False),
-            (tuple(_sphere_centers[1]), float(state.get("sensor_b_r", 0.05)), "sensor_b", False),
+            (tuple(_sphere_centers[0]), sa_hs, "sensor_a", "box"),
+            (tuple(_sphere_centers[1]), sb_hs, "sensor_b", "box"),
             ((state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]),
-                float(state["roll_a_radius"]), "roll_a", True),
+                float(state["roll_a_radius"]), "roll_a", "cyl"),
             ((state["roll_b_x"], state["roll_b_y"], state["roll_b_z"]),
-                float(state["roll_b_radius"]), "roll_b", True),
+                float(state["roll_b_radius"]), "roll_b", "cyl"),
             ((state["cyl_x"], state["cyl_y"], state["cyl_z"]),
-                float(state["cyl_radius"]), "cyl", True),
-            ((state["cyl2_x"], state["cyl2_y"], state["cyl2_z"]),
-                float(state["cyl2_radius"]), "cyl2", True),
+                float(state["cyl_radius"]), "cyl", "cyl"),
         ]
 
-        candidates = []  # (t, name, center, world_r, is_cyl)
-        for center, world_r, name, is_cyl in objects:
-            pr = _pick_r(center, world_r)
-            t = (_ray_zcylinder(ro, rd, center, pr, float(CYL_HALF_H))
-                 if is_cyl else _ray_sphere(ro, rd, center, pr))
+        candidates = []  # (t, name, center, geom_data, shape)
+        for center, geom_data, name, shape in objects:
+            if shape == "cyl":
+                pr = _pick_r(center, geom_data)
+                t = _ray_zcylinder(ro, rd, center, pr, float(CYL_HALF_H))
+            else:  # box
+                hx, hy, hz = geom_data
+                # Pixel-size margin: expand each half-extent so tiny boxes stay clickable
+                dist = float(np.linalg.norm(np.array(center, float) - ro))
+                one_px = max(dist * 2.0 * half_tan / ch, 1e-6)
+                m = _MIN_HIT_PX * one_px
+                t = _ray_aabb(ro, rd, center, hx + m, hy + m, hz + m)
             if t is not None and t > 1e-3:
-                candidates.append((t, name, center, world_r, is_cyl))
+                candidates.append((t, name, center, geom_data, shape))
 
         candidates.sort(key=lambda x: x[0])
 
@@ -1157,17 +1465,18 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
         print(f"[pick] click=({sx:.0f},{sy:.0f})  {dbg}", flush=True)
 
         if not candidates:
-            # Plane fallback: project onto plane through plane_pt or camera center,
-            # perpendicular to ray direction (so the dot lands at the click depth).
             ctr = np.array(cam.center, dtype=float)
             ref = ctr if plane_pt is None else np.array(plane_pt, dtype=float)
             t_plane = float(np.dot(ref - ro, rd))
             return (ro + rd * t_plane, None) if t_plane > 0 else (None, None)
 
-        # Recompute the surface hit point with TRUE radius for the winning object
-        _, best_obj, best_center, best_r, best_is_cyl = candidates[0]
-        t_true = (_ray_zcylinder(ro, rd, best_center, best_r, float(CYL_HALF_H))
-                  if best_is_cyl else _ray_sphere(ro, rd, best_center, best_r))
+        # Recompute hit point on the TRUE (un-expanded) geometry for the winner
+        _, best_obj, best_center, best_geom, best_shape = candidates[0]
+        if best_shape == "cyl":
+            t_true = _ray_zcylinder(ro, rd, best_center, best_geom, float(CYL_HALF_H))
+        else:
+            hx, hy, hz = best_geom
+            t_true = _ray_aabb(ro, rd, best_center, hx, hy, hz)
         t_final = t_true if (t_true is not None and t_true > 1e-3) else candidates[0][0]
         return ro + rd * t_final, best_obj
 
@@ -1220,8 +1529,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             _refresh_gizmos()
             return   # don't block camera
 
-        # Only sensors are draggable for now; others just get selected
-        if _sel["who"] not in ("sensor_a", "sensor_b"):
+        # Draggable: sensors + guide cylinders.  Rolls are anchor points for
+        # the yarn (particles 0 and N-1) so rebuilding them mid-sim resets
+        # state — they remain slider-only.
+        if _sel["who"] not in ("sensor_a", "sensor_b", "cyl"):
             event._blocked = True
             return
         _sel["dragging"]         = True
@@ -1250,6 +1561,10 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
             state["sensor_b_x"] = x; state["sensor_b_y"] = y; state["sensor_b_z"] = z
             _sphere_centers[1]  = new_pos
             rebuild_scB()
+        elif who == "cyl":
+            state["cyl_x"]  = x; state["cyl_y"]  = y; state["cyl_z"]  = z
+            rebuild_guide()
+            rebuild_detect_vol()
 
         _update_sensor_visuals()
         _refresh_gizmos()
@@ -1301,11 +1616,11 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
                         rebuild_roll_b()
                     elif key in ("cyl_x", "cyl_y", "cyl_z", "cyl_radius"):
                         rebuild_guide()
-                    elif key in ("cyl2_x", "cyl2_y", "cyl2_z", "cyl2_radius"):
-                        rebuild_cyl2()
-                    elif key == "cyl2_enabled":
-                        cyl2_vis.visible = bool(int(value))
-                        _graph[0] = None
+                        rebuild_detect_vol()
+                    elif key == "cyl_detect_r":
+                        rebuild_detect_vol()
+                    elif key == "cyl_detect_show":
+                        cyl_detect_vis.visible = bool(int(value))
                     elif key in ("sensor_a_x", "sensor_a_y", "sensor_a_z", "sensor_a_cyl_r"):
                         rebuild_scA()
                     elif key == "sensor_a_cyl_enabled":
@@ -1382,7 +1697,7 @@ def sim_worker(cmd_queue, shared, script_dir: str, defaults: dict):
 
 # ── Tkinter control panel (parent process) ────────────────────────────────────
 
-def run_ui(cmd_queue, shared):
+def run_ui(cmd_queue, shared, dbg_shared):
     import json
     import tkinter as tk
     from tkinter import ttk, filedialog
@@ -1425,6 +1740,7 @@ def run_ui(cmd_queue, shared):
     # Registries used by save / load.
     param_vars      = {}   # key → DoubleVar
     param_callbacks = {}   # key → on_change(v)
+    param_ranges    = {}   # key → (min_var, max_var, apply_fn)  for editable_range sliders
 
     def add_slider(label, key, from_, to_, default, is_int=False, fmt="{:.3f}",
                    editable_range=False):
@@ -1494,6 +1810,9 @@ def run_ui(cmd_queue, shared):
             max_e.pack(side="left", padx=2)
             max_e.bind("<Return>", _apply_range)
             max_e.bind("<FocusOut>", _apply_range)
+
+            # Expose this slider's range so save/load can persist it.
+            param_ranges[key] = (min_var, max_var, _apply_range)
 
         param_vars[key]      = val_var
         param_callbacks[key] = on_change
@@ -1566,7 +1885,10 @@ def run_ui(cmd_queue, shared):
     add_slider("Sensor A  X", "sensor_a_x", -3.0, 3.0, DEFAULTS["sensor_a_x"], fmt="{:+.3f}")
     add_slider("Sensor A  Y", "sensor_a_y", -3.0, 3.0, DEFAULTS["sensor_a_y"], fmt="{:+.3f}")
     add_slider("Sensor A  Z", "sensor_a_z", -3.0, 3.0, DEFAULTS["sensor_a_z"], fmt="{:+.3f}")
-    add_slider("Sensor A  sphere radius (m)", "sensor_a_r", 0.01, 0.5, DEFAULTS["sensor_a_r"], fmt="{:.3f}")
+    add_slider("Sensor A  half-extent X (m)", "sensor_a_hx", 0.001, 0.5, DEFAULTS["sensor_a_hx"], fmt="{:.3f}")
+    add_slider("Sensor A  half-extent Y (m)", "sensor_a_hy", 0.001, 0.5, DEFAULTS["sensor_a_hy"], fmt="{:.3f}")
+    add_slider("Sensor A  half-extent Z (m)", "sensor_a_hz", 0.001, 0.5, DEFAULTS["sensor_a_hz"], fmt="{:.3f}")
+    add_slider("Sensor A  opacity",           "sensor_a_alpha", 0.0, 1.0, DEFAULTS["sensor_a_alpha"], fmt="{:.2f}")
     _scA_en_var = tk.IntVar(value=DEFAULTS["sensor_a_cyl_enabled"])
     _scA_en_frm = ttk.Frame(scroll_frm)
     _scA_en_frm.pack(fill="x", padx=8, pady=3)
@@ -1584,7 +1906,10 @@ def run_ui(cmd_queue, shared):
     add_slider("Sensor B  X", "sensor_b_x", -3.0, 3.0, DEFAULTS["sensor_b_x"], fmt="{:+.3f}")
     add_slider("Sensor B  Y", "sensor_b_y", -3.0, 3.0, DEFAULTS["sensor_b_y"], fmt="{:+.3f}")
     add_slider("Sensor B  Z", "sensor_b_z", -3.0, 3.0, DEFAULTS["sensor_b_z"], fmt="{:+.3f}")
-    add_slider("Sensor B  sphere radius (m)", "sensor_b_r", 0.01, 0.5, DEFAULTS["sensor_b_r"], fmt="{:.3f}")
+    add_slider("Sensor B  half-extent X (m)", "sensor_b_hx", 0.001, 0.5, DEFAULTS["sensor_b_hx"], fmt="{:.3f}")
+    add_slider("Sensor B  half-extent Y (m)", "sensor_b_hy", 0.001, 0.5, DEFAULTS["sensor_b_hy"], fmt="{:.3f}")
+    add_slider("Sensor B  half-extent Z (m)", "sensor_b_hz", 0.001, 0.5, DEFAULTS["sensor_b_hz"], fmt="{:.3f}")
+    add_slider("Sensor B  opacity",           "sensor_b_alpha", 0.0, 1.0, DEFAULTS["sensor_b_alpha"], fmt="{:.2f}")
     _scB_en_var = tk.IntVar(value=DEFAULTS["sensor_b_cyl_enabled"])
     _scB_en_frm = ttk.Frame(scroll_frm)
     _scB_en_frm.pack(fill="x", padx=8, pady=3)
@@ -1621,23 +1946,21 @@ def run_ui(cmd_queue, shared):
     add_slider("Guide Y",      "cyl_y",      -3.0,  3.0, DEFAULTS["cyl_y"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide Z",      "cyl_z",      -3.0,  3.0, DEFAULTS["cyl_z"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide radius", "cyl_radius",  0.02, 0.5, DEFAULTS["cyl_radius"])
-
-    section("Frictionless guide cylinder (light grey)")
-    _cyl2_en_var = tk.IntVar(value=DEFAULTS["cyl2_enabled"])
-    _cyl2_en_frm = ttk.Frame(scroll_frm)
-    _cyl2_en_frm.pack(fill="x", padx=8, pady=3)
-    def _on_cyl2_toggle():
-        cmd_queue.put(("param", "cyl2_enabled", _cyl2_en_var.get()))
-    ttk.Checkbutton(_cyl2_en_frm, text="Enable frictionless guide",
-                    variable=_cyl2_en_var, command=_on_cyl2_toggle).pack(side="left")
-    param_vars["cyl2_enabled"]      = _cyl2_en_var
-    param_callbacks["cyl2_enabled"] = lambda v: (
-        _cyl2_en_var.set(int(v)), cmd_queue.put(("param", "cyl2_enabled", int(v)))
+    add_slider("Wrap-detect radius (m)", "cyl_detect_r", 0.05, 1.0,
+               DEFAULTS["cyl_detect_r"], fmt="{:.3f}")
+    _cyl_det_show_var = tk.IntVar(value=DEFAULTS["cyl_detect_show"])
+    _cyl_det_show_frm = ttk.Frame(scroll_frm)
+    _cyl_det_show_frm.pack(fill="x", padx=8, pady=3)
+    def _on_cyl_det_show_toggle():
+        cmd_queue.put(("param", "cyl_detect_show", _cyl_det_show_var.get()))
+    ttk.Checkbutton(_cyl_det_show_frm, text="Show wrap-detect volume",
+                    variable=_cyl_det_show_var,
+                    command=_on_cyl_det_show_toggle).pack(side="left")
+    param_vars["cyl_detect_show"]      = _cyl_det_show_var
+    param_callbacks["cyl_detect_show"] = lambda v: (
+        _cyl_det_show_var.set(int(v)),
+        cmd_queue.put(("param", "cyl_detect_show", int(v)))
     )
-    add_slider("Frictionless guide X",      "cyl2_x",      -3.0, 3.0, DEFAULTS["cyl2_x"],      fmt="{:+.3f}", editable_range=True)
-    add_slider("Frictionless guide Y",      "cyl2_y",      -3.0, 3.0, DEFAULTS["cyl2_y"],      fmt="{:+.3f}", editable_range=True)
-    add_slider("Frictionless guide Z",      "cyl2_z",      -3.0, 3.0, DEFAULTS["cyl2_z"],      fmt="{:+.3f}", editable_range=True)
-    add_slider("Frictionless guide radius", "cyl2_radius",  0.02, 0.5, DEFAULTS["cyl2_radius"])
 
     # ── Save / Load ───────────────────────────────────────────────────────────
 
@@ -1651,6 +1974,17 @@ def run_ui(cmd_queue, shared):
         if not path:
             return
         data = {k: v.get() for k, v in param_vars.items()}
+        # Persist custom slider ranges so widened sliders survive a save/load
+        # round trip (otherwise editable_range sliders snap back to defaults
+        # on load and silently clamp values outside the default range).
+        ranges = {}
+        for key, (min_var, max_var, _) in param_ranges.items():
+            try:
+                ranges[key] = [float(min_var.get()), float(max_var.get())]
+            except ValueError:
+                pass
+        if ranges:
+            data["_ranges"] = ranges
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         print(f"[ui] saved parameters to {path}", flush=True)
@@ -1664,7 +1998,18 @@ def run_ui(cmd_queue, shared):
             return
         with open(path) as f:
             data = json.load(f)
+        # Restore custom slider ranges FIRST so subsequent value loads don't
+        # get clamped to a narrower default range.
+        ranges = data.get("_ranges", {}) or {}
+        for key, lo_hi in ranges.items():
+            if key in param_ranges and isinstance(lo_hi, (list, tuple)) and len(lo_hi) == 2:
+                min_var, max_var, apply_fn = param_ranges[key]
+                min_var.set(str(lo_hi[0]))
+                max_var.set(str(lo_hi[1]))
+                apply_fn()
         for key, value in data.items():
+            if key == "_ranges":
+                continue
             if key in param_vars and key in param_callbacks:
                 param_vars[key].set(value)
                 param_callbacks[key](value)
@@ -1874,13 +2219,14 @@ def run_ui(cmd_queue, shared):
 
         T_a    = shared[0];  T_b   = shared[1]
         theta  = shared[2];  pred  = shared[3];  resid = shared[4]
+        n_ctc  = int(shared[6])
         mu_k   = float(param_vars.get("mu_kinetic", tk.DoubleVar(value=0.0)).get())
         theta_r = math.radians(theta)
         _info_var.set(
             f"T_A = {T_a:7.3f} cN  (upstream,  yellow)      "
             f"T_B = {T_b:7.3f} cN  (downstream, green)\n"
-            f"Wrap angle θ = {theta:.1f}°    μ_k = {mu_k:.4f}    "
-            f"e^(μ_k·θ) = {math.exp(mu_k * theta_r):.4f}\n"
+            f"Wrap angle θ = {theta:.1f}° ({n_ctc} pts on guide)    "
+            f"μ_k = {mu_k:.4f}    e^(μ_k·θ) = {math.exp(mu_k * theta_r):.4f}\n"
             f"Measured ratio T_B/T_A = {(T_b/T_a if T_a > 1e-6 else 0):.4f}    "
             f"Capstan pred T_B = {pred:.3f} cN    Residual = {resid:.4f}"
         )
@@ -1889,8 +2235,289 @@ def run_ui(cmd_queue, shared):
 
     root.after(500, _update_graph)   # start after half a second
 
+    # ── Wrap-angle debug top-down view ────────────────────────────────────────
+    # A live 2D rendering of what _wrap_angle_contacts is doing:
+    #   • dashed grey circle = search disk (radius = cyl_detect_r)
+    #   • dashed dark-green pair = arc-band edges (r_contact ± arc_tol)
+    #   • solid green ring = contact circle (r_cyl + ogc_r)
+    #   • olive disc = cylinder cross-section (r_cyl)
+    #   • dots = particles in the search region, coloured by classification:
+    #       grey   = in search disk only (rejected by longest-run filter)
+    #       yellow = in the longest contiguous yarn run
+    #       green  = passed arc-band filter — these are the particles used
+    #                in the θ summation
+    #   • bright green polyline = the arc, in yarn-index order
+    #   • pink/blue rays + rings = refined in/out tangent points (the
+    #                              true boundary of the wrap arc)
+    WRAP_BG = "#101015"
+    wrap_win = tk.Toplevel(root)
+    wrap_win.title("Wrap-angle debug — top-down view")
+    wrap_win.geometry("560x640")
+    wrap_win.protocol("WM_DELETE_WINDOW", lambda: None)
+    wrap_win.configure(bg=WRAP_BG)
+
+    wrap_canvas = tk.Canvas(wrap_win, bg=WRAP_BG, highlightthickness=0)
+    wrap_canvas.pack(fill="both", expand=True)
+
+    wrap_info_var = tk.StringVar(value="Waiting for sim data...")
+    tk.Label(wrap_win, textvariable=wrap_info_var, font=("Courier", 9),
+             fg="white", bg=WRAP_BG, justify="left", anchor="w"
+             ).pack(fill="x", padx=8, pady=(2, 0))
+
+    legend_frm = tk.Frame(wrap_win, bg=WRAP_BG)
+    legend_frm.pack(fill="x", padx=8, pady=(2, 6))
+    for txt, col in (("● search",       "#888899"),
+                     ("● longest",      "#ffcc44"),
+                     ("● arc",          "#33ff88"),
+                     ("│ Δθ ticks",     "#22aa55"),
+                     ("◜ swept θ →",    "#ff44dd"),
+                     ("○ in",           "#ff5577"),
+                     ("○ out",          "#55aaff")):
+        tk.Label(legend_frm, text=txt, fg=col, bg=WRAP_BG,
+                 font=("Courier", 9)).pack(side="left", padx=4)
+
+    # View rotation — lets the user spin the whole top-down picture so a
+    # known reference (typically the refined-in tangent) aligns to +X.  Then
+    # checking "is this 90°?" becomes "is the other tangent vertical?".
+    _view_rot_deg = tk.DoubleVar(value=0.0)
+    rot_frm = tk.Frame(wrap_win, bg=WRAP_BG)
+    rot_frm.pack(fill="x", padx=8, pady=(0, 6))
+    tk.Label(rot_frm, text="View rotation°", fg="white", bg=WRAP_BG,
+             font=("Courier", 9)).pack(side="left")
+    ttk.Scale(rot_frm, from_=-180.0, to=180.0, variable=_view_rot_deg,
+              orient="horizontal").pack(side="left", fill="x",
+                                         expand=True, padx=6)
+    _view_rot_lbl = tk.Label(rot_frm, text="+0°", fg="white", bg=WRAP_BG,
+                             font=("Courier", 9), width=6)
+    _view_rot_lbl.pack(side="left")
+
+    def _snap_in_to_zero():
+        # Rotate so the refined "in" tangent lies on the +X axis.
+        rin_x = float(dbg_shared[10]); rin_y = float(dbg_shared[11])
+        if math.isnan(rin_x) or math.isnan(rin_y):
+            return
+        ang = math.degrees(math.atan2(rin_y, rin_x))
+        _view_rot_deg.set(-ang)
+
+    def _reset_rotation():
+        _view_rot_deg.set(0.0)
+
+    tk.Button(rot_frm, text="in→0°", command=_snap_in_to_zero,
+              font=("Courier", 8)).pack(side="left", padx=(4, 0))
+    tk.Button(rot_frm, text="reset", command=_reset_rotation,
+              font=("Courier", 8)).pack(side="left", padx=(2, 0))
+
+    _wrap_alive = [True]
+
+    def _update_wrap_debug():
+        if not _wrap_alive[0]:
+            return
+        cv = wrap_canvas
+        cv.delete("all")
+        W = cv.winfo_width();  H = cv.winfo_height()
+        if W < 60 or H < 60:
+            root.after(150, _update_wrap_debug)
+            return
+
+        n_search    = int(dbg_shared[0])
+        r_cyl       = float(dbg_shared[3])
+        r_contact   = float(dbg_shared[4])
+        arc_tol     = float(dbg_shared[5])
+        rd          = float(dbg_shared[6])
+        theta       = float(dbg_shared[7])
+        n_arc       = int(dbg_shared[8])
+        longest_len = int(dbg_shared[9])
+        rin_x       = float(dbg_shared[10])
+        rin_y       = float(dbg_shared[11])
+        rout_x      = float(dbg_shared[12])
+        rout_y      = float(dbg_shared[13])
+        signed_th   = float(dbg_shared[15])
+
+        ext = max(rd * 1.15, r_contact * 1.5, 0.05)
+        margin = 24
+        sz = min(W, H) - 2 * margin
+        if sz <= 0:
+            root.after(150, _update_wrap_debug)
+            return
+        scale = sz / (2.0 * ext)
+        ox    = W / 2.0
+        oy    = H / 2.0
+
+        rot_deg = float(_view_rot_deg.get())
+        _view_rot_lbl.config(text=f"{rot_deg:+4.0f}°")
+        ca = math.cos(math.radians(rot_deg))
+        sa = math.sin(math.radians(rot_deg))
+
+        def to_cv(x, y):
+            # Rotate (world) by rot_deg CCW, then map to canvas with Y-flip.
+            xr = x * ca - y * sa
+            yr = x * sa + y * ca
+            return ox + xr * scale, oy - yr * scale
+
+        def draw_circle(r, **kw):
+            # Concentric on origin — bounding box is rotation-invariant, so
+            # bypass to_cv (avoids drawing a rotated rectangle's bbox).
+            cv.create_oval(ox - r * scale, oy - r * scale,
+                           ox + r * scale, oy + r * scale, **kw)
+
+        if rd > 0:
+            draw_circle(rd, outline="#3a4a5a", width=1, dash=(4, 4))
+        if r_contact > 0 and arc_tol > 0:
+            draw_circle(r_contact - arc_tol, outline="#225544", width=1, dash=(2, 3))
+            draw_circle(r_contact + arc_tol, outline="#225544", width=1, dash=(2, 3))
+        if r_contact > 0:
+            draw_circle(r_contact, outline="#33aa55", width=2)
+        if r_cyl > 0:
+            draw_circle(r_cyl, outline="#aabb55", fill="#262318", width=2)
+
+        ox_c, oy_c = to_cv(0, 0)
+        cv.create_line(ox_c - 7, oy_c,     ox_c + 7, oy_c,     fill="#555566")
+        cv.create_line(ox_c,     oy_c - 7, ox_c,     oy_c + 7, fill="#555566")
+
+        # Radial measurement lines: from each arc particle to the centroid.
+        # Drawn first so they sit behind everything else.  Lets you eyeball
+        # angles between any two arc particles directly.
+        for k in range(min(n_search, MAX_DEBUG_PARTS)):
+            off = DBG_HEADER_LEN + DBG_STRIDE * k
+            if int(dbg_shared[off + 3]) != 2:
+                continue
+            px = float(dbg_shared[off + 0])
+            py = float(dbg_shared[off + 1])
+            xe, ye = to_cv(px, py)
+            cv.create_line(ox_c, oy_c, xe, ye,
+                           fill="#2a5a3a", width=1)
+
+        arc_xy_cv = []
+        n = min(n_search, MAX_DEBUG_PARTS)
+        for k in range(n):
+            off = DBG_HEADER_LEN + DBG_STRIDE * k
+            px  = float(dbg_shared[off + 0])
+            py  = float(dbg_shared[off + 1])
+            cls = int(dbg_shared[off + 3])
+            cxp, cyp = to_cv(px, py)
+            if cls == 2:
+                col, rdot = "#33ff88", 4
+                arc_xy_cv.append((cxp, cyp))
+            elif cls == 1:
+                col, rdot = "#ffcc44", 3
+            else:
+                col, rdot = "#888899", 2
+            cv.create_oval(cxp - rdot, cyp - rdot,
+                           cxp + rdot, cyp + rdot,
+                           fill=col, outline="")
+
+        if len(arc_xy_cv) >= 2:
+            flat = [c for pt in arc_xy_cv for c in pt]
+            cv.create_line(*flat, fill="#66ffaa", width=2)
+
+        # ── Visualize what the algorithm THINKS the angle is ─────────────
+        # The arc is drawn on the contact circle, starting from the refined
+        # "in" azimuth, sweeping signed_theta radians (signed = direction
+        # the algorithm summed Δθ).  If the algorithm is correct, the arc
+        # end should land on the refined "out" boundary marker.  Any
+        # mismatch is the bug, visualized.
+        start_ang = None
+        if not (math.isnan(rin_x) or math.isnan(rin_y)):
+            start_ang = math.atan2(rin_y, rin_x)
+        else:
+            # Fallback: first arc particle (in yarn-index order)
+            for k in range(min(n_search, MAX_DEBUG_PARTS)):
+                off = DBG_HEADER_LEN + DBG_STRIDE * k
+                if int(dbg_shared[off + 3]) == 2:
+                    px = float(dbg_shared[off + 0])
+                    py = float(dbg_shared[off + 1])
+                    if px*px + py*py > 1e-12:
+                        start_ang = math.atan2(py, px)
+                    break
+
+        if start_ang is not None and abs(signed_th) > 1e-6 and r_contact > 0:
+            r_draw = r_contact * 1.04   # slightly outside contact for visibility
+            n_samp = max(16, int(abs(math.degrees(signed_th)) / 3.0))
+            pts = []
+            for i in range(n_samp + 1):
+                t = i / n_samp
+                a = start_ang + signed_th * t
+                px = r_draw * math.cos(a)
+                py = r_draw * math.sin(a)
+                pts.append(to_cv(px, py))
+            flat = [c for pt in pts for c in pt]
+            cv.create_line(*flat, fill="#ff44dd", width=4, capstyle="round")
+
+            # θ label near the midpoint of the swept arc
+            mid_a = start_ang + signed_th * 0.5
+            lx, ly = to_cv(r_draw * 1.22 * math.cos(mid_a),
+                           r_draw * 1.22 * math.sin(mid_a))
+            cv.create_text(lx, ly,
+                           text=f"θ = {math.degrees(abs(signed_th)):.1f}°",
+                           fill="#ff66ee",
+                           font=("Courier", 11, "bold"))
+
+            # Small arrow head at the arc end to show sweep direction.
+            # Tangent direction in canvas space (accounting for Y-flip).
+            end_a = start_ang + signed_th
+            ex, ey = to_cv(r_draw * math.cos(end_a),
+                           r_draw * math.sin(end_a))
+            # World CCW tangent at angle a is (-sin a, cos a); after the
+            # view rotation by rot_deg and then the canvas Y-flip, this
+            # becomes (-sin(a+rot), -cos(a+rot)).  Reverse for CW.
+            rot_rad = math.radians(rot_deg)
+            tx_cv = -math.sin(end_a + rot_rad)
+            ty_cv = -math.cos(end_a + rot_rad)
+            if signed_th < 0:
+                tx_cv, ty_cv = -tx_cv, -ty_cv
+            tang_ang = math.atan2(ty_cv, tx_cv)
+            head_len = 9
+            for da in (math.radians(150), math.radians(-150)):
+                hx = ex + head_len * math.cos(tang_ang + da)
+                hy = ey + head_len * math.sin(tang_ang + da)
+                cv.create_line(ex, ey, hx, hy, fill="#ff44dd",
+                               width=3, capstyle="round")
+
+        # Radial ticks at each arc particle's azimuth (the discrete sample
+        # points the algorithm sums Δθ across, pre-refinement)
+        for k in range(min(n_search, MAX_DEBUG_PARTS)):
+            off = DBG_HEADER_LEN + DBG_STRIDE * k
+            if int(dbg_shared[off + 3]) != 2:
+                continue
+            px = float(dbg_shared[off + 0])
+            py = float(dbg_shared[off + 1])
+            r2 = px*px + py*py
+            if r2 < 1e-12:
+                continue
+            inv = 1.0 / math.sqrt(r2)
+            ux, uy = px * inv, py * inv     # unit radial in world coords
+            r_in  = r_contact * 0.93
+            r_out = r_contact * 1.07
+            x0, y0 = to_cv(ux * r_in,  uy * r_in)
+            x1, y1 = to_cv(ux * r_out, uy * r_out)
+            cv.create_line(x0, y0, x1, y1, fill="#22aa55", width=1)
+
+        if not (math.isnan(rin_x) or math.isnan(rin_y)):
+            cxp, cyp = to_cv(rin_x, rin_y)
+            cv.create_line(ox_c, oy_c, cxp, cyp,
+                           fill="#ff5577", width=1, dash=(3, 3))
+            cv.create_oval(cxp - 6, cyp - 6, cxp + 6, cyp + 6,
+                           outline="#ff5577", width=2)
+        if not (math.isnan(rout_x) or math.isnan(rout_y)):
+            cxp, cyp = to_cv(rout_x, rout_y)
+            cv.create_line(ox_c, oy_c, cxp, cyp,
+                           fill="#55aaff", width=1, dash=(3, 3))
+            cv.create_oval(cxp - 6, cyp - 6, cxp + 6, cyp + 6,
+                           outline="#55aaff", width=2)
+
+        wrap_info_var.set(
+            f"θ = {math.degrees(theta):6.1f}°    n_arc = {n_arc}    "
+            f"longest_run = {longest_len}    n_search = {n_search}\n"
+            f"r_cyl = {r_cyl:.4f}    r_contact = {r_contact:.4f}    "
+            f"arc_tol = ±{arc_tol:.4f}    rd = {rd:.3f}"
+        )
+        root.after(100, _update_wrap_debug)
+
+    root.after(700, _update_wrap_debug)
+
     def on_close():
         _graph_alive[0] = False
+        _wrap_alive[0]  = False
         send("stop")
         plt.close(fig)          # release matplotlib Tk callbacks before destroy
         root.quit()             # exits mainloop(); __main__ finally block cleans up
@@ -1906,16 +2533,19 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
     # Shared memory: [T_a(cN), T_b(cN), theta_deg, capstan_pred(cN), residual, sim_time]
-    shared = mp.Array('d', 6)
+    shared = mp.Array('d', 7)
+    # Wrap-angle debug: header + per-particle classification block (see top of file)
+    dbg_shared = mp.Array('d', DBG_ARRAY_LEN)
 
     cmd_queue = mp.Queue()
     worker = mp.Process(
-        target=sim_worker, args=(cmd_queue, shared, _SCRIPT_DIR, DEFAULTS),
+        target=sim_worker,
+        args=(cmd_queue, shared, dbg_shared, _SCRIPT_DIR, DEFAULTS),
     )
     worker.start()
 
     try:
-        run_ui(cmd_queue, shared)
+        run_ui(cmd_queue, shared, dbg_shared)
     finally:
         cmd_queue.put(("stop",))
         worker.join(timeout=5.0)

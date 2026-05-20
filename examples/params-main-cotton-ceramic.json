@@ -11,7 +11,7 @@
   "constraint_iter": 1.0,
   "ogc_r": 0.005,
   "ogc_stiff": 1.0,
-  "mu_static": 0.22,
+  "mu_static": 0.0,
   "mu_kinetic": 0.16,
   "v_max": 20.0,
   "self_collision": 0,
@@ -20,13 +20,19 @@
   "sensor_a_x": -0.3,
   "sensor_a_y": 0.1,
   "sensor_a_z": 0.0,
-  "sensor_a_r": 0.17333333333333334,
+  "sensor_a_hx": 0.04135305719921104,
+  "sensor_a_hy": 0.37697238658777116,
+  "sensor_a_hz": 0.37697238658777116,
+  "sensor_a_alpha": 0.0,
   "sensor_a_cyl_enabled": 0,
   "sensor_a_cyl_r": 0.03,
   "sensor_b_x": 0.2,
-  "sensor_b_y": -0.1,
+  "sensor_b_y": -0.30177514792899407,
   "sensor_b_z": 0.2,
-  "sensor_b_r": 0.19072978303747534,
+  "sensor_b_hx": 0.05906903353057199,
+  "sensor_b_hy": 0.37697238658777116,
+  "sensor_b_hz": 0.37697238658777116,
+  "sensor_b_alpha": 0.0,
   "sensor_b_cyl_enabled": 0,
   "sensor_b_cyl_r": 0.03,
   "roll_a_x": -0.8,
@@ -45,10 +51,29 @@
   "cyl_y": -0.32444444444444454,
   "cyl_z": -0.03111111111111109,
   "cyl_radius": 0.08,
-  "cyl2_enabled": 0,
-  "cyl2_x": 0.0,
-  "cyl2_y": 0.0,
-  "cyl2_z": 0.3,
-  "cyl2_radius": 0.05,
-  "heatmap_mode": 1
+  "cyl_detect_r": 0.20,
+  "cyl_detect_show": 0,
+  "heatmap_mode": 1,
+  "_ranges": {
+    "mu_kinetic": [
+      0.0,
+      1.0
+    ],
+    "pull_speed": [
+      -5.0,
+      5.0
+    ],
+    "cyl_x": [
+      -3.0,
+      3.0
+    ],
+    "cyl_y": [
+      -3.0,
+      3.0
+    ],
+    "cyl_z": [
+      -3.0,
+      3.0
+    ]
+  }
 }
