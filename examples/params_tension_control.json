@@ -1,0 +1,95 @@
+{
+  "heatmap_max_strain": 1.0,
+  "yarn_length": 50.02465483234714,
+  "particle_density": 53.84615384615385,
+  "gravity_y": -9.81,
+  "particle_mass": 1e-05,
+  "damping": 0.9994074074074074,
+  "stretch_stiff": 0.30303030303030304,
+  "bend_stiff": 0.0,
+  "substeps": 104.0,
+  "constraint_iter": 1.0,
+  "ogc_r": 0.005,
+  "ogc_stiff": 1.0,
+  "mu_static": 0.0,
+  "mu_kinetic": 0.00031558185404339254,
+  "v_max": 20.0,
+  "self_collision": 0,
+  "self_ee_stiff": 0.2938856015779093,
+  "redetect_threshold": 0.3,
+  "sensor_a_x": -0.3,
+  "sensor_a_y": 0.1,
+  "sensor_a_z": 0.0,
+  "sensor_a_hx": 0.04135305719921104,
+  "sensor_a_hy": 0.5,
+  "sensor_a_hz": 0.5,
+  "sensor_a_alpha": 0.023668639053254437,
+  "sensor_a_cyl_enabled": 0,
+  "sensor_a_cyl_r": 0.03,
+  "sensor_b_x": 0.2,
+  "sensor_b_y": -0.30177514792899407,
+  "sensor_b_z": 0.2,
+  "sensor_b_hx": 0.05906903353057199,
+  "sensor_b_hy": 0.5,
+  "sensor_b_hz": 0.5,
+  "sensor_b_alpha": 0.03353057199211045,
+  "sensor_b_cyl_enabled": 0,
+  "sensor_b_cyl_r": 0.03,
+  "roll_a_x": -0.8,
+  "roll_a_y": 0.0,
+  "roll_a_z": 0.0,
+  "roll_a_radius": 0.15,
+  "roll_a_mass": 0.5219330453563715,
+  "roll_a_bearing_damping": 0.9978401727861771,
+  "roll_a_torque_scale": 1.0,
+  "roll_a_servo_on": 1,
+  "roll_a_tension_setpoint": 51.28205128205128,
+  "roll_a_kp": 0.2761341222879684,
+  "roll_a_ki": 0.0013806706114398422,
+  "roll_b_x": 0.8,
+  "roll_b_y": -0.36363636363636376,
+  "roll_b_z": 0.9090909090909092,
+  "roll_b_radius": 0.15,
+  "pull_speed": -25.0,
+  "cyl_x": 0.0,
+  "cyl_y": -0.32444444444444454,
+  "cyl_z": -0.03111111111111109,
+  "cyl_radius": 0.08,
+  "cyl_detect_r": 0.2,
+  "cyl_detect_show": 0,
+  "heatmap_mode": 1,
+  "_ranges": {
+    "mu_kinetic": [
+      0.0,
+      0.01
+    ],
+    "roll_a_tension_setpoint": [
+      0.0,
+      1000.0
+    ],
+    "roll_a_kp": [
+      0.0,
+      20.0
+    ],
+    "roll_a_ki": [
+      0.0,
+      0.1
+    ],
+    "pull_speed": [
+      -25.0,
+      5.0
+    ],
+    "cyl_x": [
+      -3.0,
+      3.0
+    ],
+    "cyl_y": [
+      -3.0,
+      3.0
+    ],
+    "cyl_z": [
+      -3.0,
+      3.0
+    ]
+  }
+}

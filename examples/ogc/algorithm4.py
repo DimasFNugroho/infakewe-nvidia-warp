@@ -810,6 +810,48 @@ def roll_a_torque_step(
     )
 
 
+# ── Kernel: servo-driven roll A rotation ─────────────────────────────────────
+
+@wp.kernel
+def kernel_roll_a_servo_update(
+    pos:        wp.array(dtype=wp.vec3),
+    center:     wp.vec3,
+    orbit_r:    float,
+    sub_dt:     float,
+    omega_max:  float,
+    angle:      wp.array(dtype=float),   # size-1
+    omega:      wp.array(dtype=float),   # size-1
+    omega_cmd:  wp.array(dtype=float),   # size-1: external command from Python
+):
+    """Roll A as a servo: omega is forced to omega_cmd[0] (clamped), yarn torque
+    is ignored. Angle integrates omega; pos[0] tracks the surface."""
+    w = wp.clamp(omega_cmd[0], -omega_max, omega_max)
+    new_angle = angle[0] + w * sub_dt
+    omega[0]  = w
+    angle[0]  = new_angle
+    pos[0]    = center + wp.vec3(orbit_r * wp.cos(new_angle),
+                                  orbit_r * wp.sin(new_angle),
+                                  float(0.0))
+
+
+def roll_a_servo_step(
+    pos:        wp.array,
+    center:     wp.vec3,
+    orbit_r:    float,
+    sub_dt:     float,
+    omega_max:  float,
+    angle_wp:   wp.array,
+    omega_wp:   wp.array,
+    omega_cmd_wp: wp.array,
+    device:     str,
+):
+    wp.launch(
+        kernel_roll_a_servo_update, dim=1, device=device,
+        inputs=[pos, center, orbit_r, sub_dt, omega_max,
+                angle_wp, omega_wp, omega_cmd_wp],
+    )
+
+
 # ── Kernel: motor-driven roll B rotation ─────────────────────────────────────
 
 @wp.kernel

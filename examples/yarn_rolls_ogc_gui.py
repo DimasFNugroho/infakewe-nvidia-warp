@@ -86,6 +86,11 @@ DEFAULTS = {
     "roll_a_mass":       0.5219330453563715,  # kg — sets rotational inertia of roll A
     "roll_a_bearing_damping": 0.9978401727861771,  # per-substep drag on omega  [0..1]
     "roll_a_torque_scale":    1.0,                 # gain on yarn→roll torque
+    # Roll A — tension servo (PI on T_a, overrides passive flywheel when on)
+    "roll_a_servo_on":         0,     # 0 = passive flywheel, 1 = servo
+    "roll_a_tension_setpoint": 5.0,   # target upstream tension (cN)
+    "roll_a_kp":               1.0,   # proportional gain (rad/s per cN)
+    "roll_a_ki":               0.1,   # integral gain (rad/s per cN·s)
     # Roll B — pulling roll
     "roll_b_x":          0.8,
     "roll_b_y":         -0.36363636363636376,
@@ -97,17 +102,17 @@ DEFAULTS = {
     # Detection volume = axis-aligned box.  Half-extents along each axis (m).
     # Defaults form an upright plate: 10 cm × 10 cm × 1 cm (thin in Z), oriented
     # so the yarn travelling in the XY plane passes broadside through the plate.
-    "sensor_a_hx":  0.05,
-    "sensor_a_hy":  0.05,
-    "sensor_a_hz":  0.005,
+    "sensor_a_hx":  0.15,
+    "sensor_a_hy":  0.15,
+    "sensor_a_hz":  0.15,
     "sensor_a_alpha": 0.40,        # box visualization opacity, 0..1
     "sensor_a_cyl_r":    0.03,   # physical frictionless cylinder radius
     "sensor_a_cyl_enabled": 0,
     # Tension sensor B (downstream, green) — place on Roll-B side of guide
     "sensor_b_x":   0.20,  "sensor_b_y": -0.10,  "sensor_b_z":  0.20,
-    "sensor_b_hx":  0.05,
-    "sensor_b_hy":  0.05,
-    "sensor_b_hz":  0.005,
+    "sensor_b_hx":  0.15,
+    "sensor_b_hy":  0.15,
+    "sensor_b_hz":  0.15,
     "sensor_b_alpha": 0.40,
     "sensor_b_cyl_r":    0.03,   # physical frictionless cylinder radius
     "sensor_b_cyl_enabled": 0,
@@ -124,6 +129,7 @@ DEFAULTS = {
     "cyl_radius":        0.08,
     "cyl_detect_r":      0.20,   # detection radius for wrap-angle estimation (m)
     "cyl_detect_show":   0,      # 0 = hide detection volume, 1 = show
+    # Initial warp state
 }
 
 
@@ -156,8 +162,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     from ogc.algorithm4 import (project_vf, project_ee,
                                  apply_vf_friction, apply_ee_friction,
                                  damp_normal_velocity, clamp_velocity,
-                                 roll_a_torque_step, roll_b_motor_step,
-                                 set_particle)
+                                 roll_a_torque_step, roll_a_servo_step,
+                                 roll_b_motor_step, set_particle)
     from ogc.algorithm5 import SelfEEContacts, detect_self_ee
     from ogc.algorithm6 import project_self_ee, apply_self_ee_friction
     from kernels import (kernel_integrate,
@@ -225,14 +231,40 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     angle_b  = [0.0]   # current winding angle of particle N-1 on roll B (rad)
     angle_a  = [0.0]   # current rotation angle of roll A (rad)
     omega_a  = [0.0]   # roll A angular velocity (rad/s)
+    _servo_integral  = [0.0]   # PI integral term (cN·s)
+    _servo_omega_cmd = [0.0]   # last computed servo omega command (rad/s, for HUD)
+    _servo_t_prev    = [None]  # perf_counter() at previous PI tick
 
     # ── Geometry helpers ──────────────────────────────────────────────────────
 
+    # ── Warp geometry helper ──────────────────────────────────────────────────
+    def _external_tangent_points(C1, r1, C2, r2):
+        """External tangent point pairs for two 2-D orbit circles.
+
+        Returns up to two (T1, T2) pairs — T1 on circle-1, T2 on circle-2 —
+        each at the foot of the perpendicular from its centre to the common
+        external tangent line.  Returns [] when one circle encloses the other.
+        """
+        d = float(np.linalg.norm(C2 - C1))
+        if d < 1e-9:
+            return []
+        cos_phi = (r2 - r1) / d
+        if abs(cos_phi) > 1.0:
+            return []
+        phi = np.arccos(np.clip(cos_phi, -1.0, 1.0))
+        u = (C2 - C1) / d
+        pairs = []
+        for sign in (+1.0, -1.0):
+            c, s = np.cos(sign * phi), np.sin(sign * phi)
+            n = np.array([u[0]*c - u[1]*s, u[0]*s + u[1]*c])
+            pairs.append((C1 - r1 * n, C2 - r2 * n))
+        return pairs
+
     def init_angle_a() -> float:
-        """Initial Roll A angle: departure point faces Roll B."""
+        """Initial Roll A angle: departure point faces guide cylinder."""
         ax, ay = state["roll_a_x"], state["roll_a_y"]
-        bx, by = state["roll_b_x"], state["roll_b_y"]
-        return float(np.arctan2(by - ay, bx - ax))
+        cx, cy = state["cyl_x"],    state["cyl_y"]
+        return float(np.arctan2(cy - ay, cx - ax))
 
     def roll_b_attach(angle: float) -> np.ndarray:
         """Point on roll B surface at the given winding angle."""
@@ -242,36 +274,191 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                         dtype=np.float32)
 
     def init_angle_b() -> float:
-        """Starting angle on roll B pointing toward roll A."""
-        ax, ay = state["roll_a_x"], state["roll_a_y"]
+        """Starting angle on roll B: surface point facing guide cylinder."""
+        cx, cy = state["cyl_x"],    state["cyl_y"]
         bx, by = state["roll_b_x"], state["roll_b_y"]
-        return float(np.arctan2(ay - by, ax - bx))
+        return float(np.arctan2(cy - by, cx - bx))
 
-    def make_initial_positions() -> tuple:
-        """Helical winding on Roll A, then a nearly-taut free span to Roll B.
+    def _warp_keypoints() -> dict:
+        """Single source of truth for the warp geometry of the current configuration.
 
-        n_free is computed from the straight-line gap distance so that free-span
-        particles start at roughly REST_LEN spacing (taut).  All remaining
-        particles go to the wound section, giving more wraps and a denser
-        winding appearance.
+        Warp angle is computed purely from Roll A / guide / Roll B positions —
+        no user-supplied angle parameter.  The perpendicular-to-span criterion
+        selects the incoming and outgoing tangent sides consistent with the
+        wrap direction (CCW or CW) determined by the A-C-B cross product.
 
-        Returns (positions_array, n_wound) so callers can track the wound count.
+        Returns a dict with 2-D XY numpy arrays and scalars:
+          T_a_dep, T_c_in, T_c_out, T_b_arr  — orbit-surface tangent points
+          theta_in, theta_out                 — angles on the guide orbit circle
+          wrap_dir                            — +1 CCW, -1 CW
+          warp_rad                            — warp angle in radians (geometric)
+          orbit_r_a/c/b                       — orbit radii (phys radius + ogc_r)
         """
-        ax, ay, az = state["roll_a_x"], state["roll_a_y"], state["roll_a_z"]
-        bx, by, bz = state["roll_b_x"], state["roll_b_y"], state["roll_b_z"]
-        r         = float(state["ogc_r"])
+        ax, ay = float(state["roll_a_x"]), float(state["roll_a_y"])
+        cx, cy = float(state["cyl_x"]),    float(state["cyl_y"])
+        bx, by = float(state["roll_b_x"]), float(state["roll_b_y"])
+        r      = float(state["ogc_r"])
         orbit_r_a = max(float(state["roll_a_radius"]), 1e-6) + r
+        orbit_r_c = max(float(state["cyl_radius"]),    1e-6) + r
         orbit_r_b = max(float(state["roll_b_radius"]), 1e-6) + r
 
-        # How many free-span particles are needed to cover the gap at REST_LEN?
-        center_dist = float(np.linalg.norm([bx - ax, by - ay, bz - az]))
-        free_dist   = max(center_dist - orbit_r_a - orbit_r_b, config.REST_LEN)
-        n_free  = max(2, min(int(round(free_dist / config.REST_LEN)), N - 3))
-        n_wound = N - n_free
+        C_a = np.array([ax, ay]); C_c = np.array([cx, cy]); C_b = np.array([bx, by])
 
-        # Angular step and Z drift per segment so adjacent wraps sit one yarn-diameter apart.
+        cross_z  = (ax - cx) * (by - cy) - (ay - cy) * (bx - cx)
+        wrap_dir = +1 if cross_z < 0.0 else -1
+
+        # Unit vectors and their 90°-CCW perpendiculars for each span
+        def _unit(v):
+            n = float(np.linalg.norm(v))
+            return v / n if n > 1e-9 else np.array([1.0, 0.0])
+        def _perp(u): return np.array([-u[1], u[0]])
+
+        u_ac = _unit(C_c - C_a);  perp_ac = _perp(u_ac)
+        u_cb = _unit(C_b - C_c);  perp_cb = _perp(u_cb)
+
+        tans_ac = _external_tangent_points(C_a, orbit_r_a, C_c, orbit_r_c)
+        tans_cb = _external_tangent_points(C_c, orbit_r_c, C_b, orbit_r_b)
+
+        # Incoming tangent: pick T_c_in on the -wrap_dir side of the A→C perp
+        # (yarn enters guide on the side opposite to the wrap-rotation direction)
+        if tans_ac:
+            T_a_dep, T_c_in = max(tans_ac,
+                key=lambda p: -wrap_dir * float(np.dot(p[1] - C_c, perp_ac)))
+        else:
+            T_a_dep = C_a + orbit_r_a * u_ac
+            T_c_in  = C_c - orbit_r_c * u_ac
+
+        # Outgoing tangent: pick T_c_out on the -wrap_dir side of the C→B perp,
+        # matching the incoming criterion so entry and exit lie on the same side
+        # of the guide (opposite sign caused the chord to cut through the cylinder).
+        if tans_cb:
+            T_c_out, T_b_arr = max(tans_cb,
+                key=lambda p: -wrap_dir * float(np.dot(p[0] - C_c, perp_cb)))
+        else:
+            T_c_out = C_c + orbit_r_c * u_cb
+            T_b_arr = C_b - orbit_r_b * u_cb
+
+        theta_in  = float(np.arctan2(T_c_in[1]  - cy, T_c_in[0]  - cx))
+        theta_out = float(np.arctan2(T_c_out[1] - cy, T_c_out[0] - cx))
+        warp_rad  = (wrap_dir * (theta_out - theta_in)) % (2.0 * np.pi)
+
+        return dict(T_a_dep=T_a_dep, T_c_in=T_c_in, theta_in=theta_in,
+                    theta_out=theta_out, T_c_out=T_c_out, T_b_arr=T_b_arr,
+                    wrap_dir=wrap_dir, warp_rad=warp_rad,
+                    orbit_r_a=orbit_r_a, orbit_r_c=orbit_r_c, orbit_r_b=orbit_r_b)
+
+    def _auto_place_sensors():
+        """Auto-place sensor A/B centers at span midpoints.
+
+        Sensor A → midpoint of the free span from the last wound particle on
+                   Roll A to the guide tangent-in point.
+        Sensor B → midpoint of the guide tangent-out → Roll B arrival span.
+
+        Uses the ACTUAL last wound particle position (not T_a_dep) to account
+        for the angular advance of n_wound winding steps on Roll A.
+        The Z offset corrects for helical Z-drift along the roll axis.
+
+        Half-extents are NOT touched — user controls box size via sliders.
+        Only position (x, y, z) and _sphere_centers are updated.
+        """
+        kp = _warp_keypoints()
+        ax = float(state["roll_a_x"]);  ay = float(state["roll_a_y"])
+        az = float(state["roll_a_z"])
+        cz = float(state["cyl_z"])
+        bz = float(state["roll_b_z"])
+        orbit_r_a = kp["orbit_r_a"]
+
+        # Actual last wound particle position — the yarn departs from here, not
+        # from T_a_dep (which sits at angle_a[0] before any winding advance).
+        dtheta = config.REST_LEN / orbit_r_a
+        dz_per = 2.0 * float(state["ogc_r"]) * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
+        last_theta = angle_a[0] + (n_wound - 1) * dtheta
+        dep_x = ax + orbit_r_a * np.cos(last_theta)
+        dep_y = ay + orbit_r_a * np.sin(last_theta)
+        dep_z = az + (n_wound - 1) * dz_per
+
+        T_a_dep_3d = np.array([dep_x,              dep_y,              dep_z])
+        T_c_in_3d  = np.array([kp["T_c_in"][0],  kp["T_c_in"][1],  cz])
+        T_c_out_3d = np.array([kp["T_c_out"][0], kp["T_c_out"][1], cz])
+        T_b_arr_3d = np.array([kp["T_b_arr"][0], kp["T_b_arr"][1], bz])
+
+        mid_a = 0.5 * (T_a_dep_3d + T_c_in_3d)
+        mid_b = 0.5 * (T_c_out_3d + T_b_arr_3d)
+
+        # Orientation: local-X along the yarn tangent (so a thin-X box becomes a
+        # plate perpendicular to the yarn). Local-Z is built from world Z and
+        # then made orthogonal to X; local-Y completes the right-handed frame.
+        def _frame(p0, p1):
+            u = p1 - p0
+            n = float(np.linalg.norm(u))
+            if n < 1e-9:
+                return np.eye(3, dtype=np.float32)
+            ux = (u / n).astype(np.float32)
+            ref = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            if abs(float(np.dot(ux, ref))) > 0.99:
+                ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            uy = np.cross(ref, ux);  uy /= float(np.linalg.norm(uy))
+            uz = np.cross(ux, uy)
+            return np.column_stack([ux, uy.astype(np.float32), uz.astype(np.float32)])
+
+        _sensor_R[0] = _frame(T_a_dep_3d, T_c_in_3d)
+        _sensor_R[1] = _frame(T_c_out_3d, T_b_arr_3d)
+
+        # Only update position — user controls half-extents via sliders.
+        for k, v in (("sensor_a_x", mid_a[0]), ("sensor_a_y", mid_a[1]),
+                     ("sensor_a_z", mid_a[2])):
+            state[k] = float(v)
+        _sphere_centers[0] = mid_a.copy()
+
+        for k, v in (("sensor_b_x", mid_b[0]), ("sensor_b_y", mid_b[1]),
+                     ("sensor_b_z", mid_b[2])):
+            state[k] = float(v)
+        _sphere_centers[1] = mid_b.copy()
+
+    def make_initial_positions() -> tuple:
+        """Auto-warp initial state: wound on Roll A → straight → arc on guide → straight → Roll B.
+
+        Calls _warp_keypoints() for the tangent geometry, then distributes N
+        particles across: wound coil, free span A→guide, arc on guide, free span guide→B.
+        Also sets angle_a[0] and angle_b[0] to the exact tangent departure/arrival
+        angles so that the GPU kinematic kernels start in sync.
+
+        Returns (positions_array, n_wound).
+        """
+        kp = _warp_keypoints()
+
+        ax, ay, az = float(state["roll_a_x"]), float(state["roll_a_y"]), float(state["roll_a_z"])
+        cx, cy, cz = float(state["cyl_x"]),    float(state["cyl_y"]),    float(state["cyl_z"])
+        bx, by, bz = float(state["roll_b_x"]), float(state["roll_b_y"]), float(state["roll_b_z"])
+        r         = float(state["ogc_r"])
+        orbit_r_a = kp["orbit_r_a"]
+        orbit_r_c = kp["orbit_r_c"]
+
+        T_a_dep   = kp["T_a_dep"];   T_c_in   = kp["T_c_in"]
+        theta_in  = kp["theta_in"];  theta_out = kp["theta_out"]
+        T_c_out   = kp["T_c_out"];   T_b_arr  = kp["T_b_arr"]
+        wrap_dir  = kp["wrap_dir"];  warp_rad = kp["warp_rad"]
+
+        # ── Update kinematic angles so GPU kernels start in sync ─────────────
+        angle_a[0] = float(np.arctan2(T_a_dep[1] - ay, T_a_dep[0] - ax))
+        angle_b[0] = float(np.arctan2(T_b_arr[1] - by, T_b_arr[0] - bx))
+
+        # ── Wound section on Roll A ───────────────────────────────────────────
         dtheta = config.REST_LEN / orbit_r_a
         dz     = 2.0 * r * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
+
+        # Compute path lengths to distribute the free-span budget
+        T_c_in_3d  = np.array([T_c_in[0],  T_c_in[1],  cz])
+        T_c_out_3d = np.array([T_c_out[0], T_c_out[1], cz])
+        T_b_arr_3d = np.array([T_b_arr[0], T_b_arr[1], bz])
+
+        span_AC    = float(np.linalg.norm(T_c_in  - T_a_dep))
+        arc_len    = orbit_r_c * warp_rad
+        span_CB    = float(np.linalg.norm(T_b_arr - T_c_out))
+        total_free = max(span_AC + arc_len + span_CB, config.REST_LEN)
+
+        n_free  = max(3, min(int(round(total_free / config.REST_LEN)), N - 3))
+        n_wound = N - n_free
 
         positions: list = []
         for i in range(n_wound):
@@ -280,14 +467,30 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                                ay + orbit_r_a * np.sin(theta),
                                az + i * dz])
 
-        # Free span: straight line from departure point to Roll B tip.
-        p_dep = np.array(positions[-1], dtype=np.float32)
-        p_end = np.array([bx + orbit_r_b * np.cos(angle_b[0]),
-                          by + orbit_r_b * np.sin(angle_b[0]),
-                          bz], dtype=np.float32)
-        for i in range(1, n_free + 1):
-            t = i / n_free
-            positions.append(list(p_dep + t * (p_end - p_dep)))
+        # Distribute n_free across the 3 free-span segments proportionally
+        n_AC  = max(1, min(round(n_free * span_AC  / total_free), n_free - 2))
+        n_arc = max(1, min(round(n_free * arc_len  / total_free), n_free - n_AC - 1))
+        n_CB  = max(1, n_free - n_AC - n_arc)
+
+        # Segment 1: last wound particle → guide tangent-in
+        p_dep = np.array(positions[-1])
+        for i in range(1, n_AC + 1):
+            t = i / n_AC
+            positions.append(list(p_dep + t * (T_c_in_3d - p_dep)))
+
+        # Segment 2: arc on guide orbit surface
+        for i in range(1, n_arc + 1):
+            t     = i / n_arc
+            theta = theta_in + wrap_dir * warp_rad * t
+            positions.append([cx + orbit_r_c * np.cos(theta),
+                               cy + orbit_r_c * np.sin(theta),
+                               cz])
+
+        # Segment 3: guide tangent-out → Roll B
+        p_arc_end = np.array(positions[-1])
+        for i in range(1, n_CB + 1):
+            t = i / n_CB
+            positions.append(list(p_arc_end + t * (T_b_arr_3d - p_arc_end)))
 
         return np.array(positions[:N], dtype=np.float32), n_wound
 
@@ -330,6 +533,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
     omega_a_wp = wp.array([0.0],        dtype=float, device=device)
     angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
+    # Servo command (size-1 wp.array so updates from on_timer propagate through
+    # a captured CUDA graph without rebuild — kernel dereferences omega_cmd[0]
+    # at replay time, not capture time).
+    omega_cmd_wp = wp.array([0.0], dtype=float, device=device)
 
     pos_wp      = wp.array(pos_np,                              dtype=wp.vec3, device=device)
     vel_wp      = wp.array(np.zeros((N, 3), dtype=np.float32), dtype=wp.vec3, device=device)
@@ -379,7 +586,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     def do_reinit(new_N: int):
         nonlocal N, n_even, n_odd, n_bend, n_wound
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
-        nonlocal angle_a_wp, omega_a_wp, angle_b_wp
+        nonlocal angle_a_wp, omega_a_wp, angle_b_wp, omega_cmd_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
         nonlocal vf_scA, ee_scA, vf_scB, ee_scB, frictionless_contacts
         nonlocal yarn_colors, pos_det_wp, max_disp_buf
@@ -396,8 +603,13 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
         omega_a_wp = wp.array([0.0],        dtype=float, device=device)
         angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
+        omega_cmd_wp = wp.array([0.0],      dtype=float, device=device)
 
         pos_np, n_wound = make_initial_positions()
+        # make_initial_positions() sets angle_a[0]/angle_b[0] to exact tangent angles — re-sync GPU.
+        angle_a_wp  = wp.array([angle_a[0]], dtype=float,   device=device)
+        angle_b_wp  = wp.array([angle_b[0]], dtype=float,   device=device)
+        _auto_place_sensors()
         pos_wp      = wp.array(pos_np,                               dtype=wp.vec3, device=device)
         vel_wp      = wp.array(np.zeros((N, 3), dtype=np.float32),   dtype=wp.vec3, device=device)
         prev_pos_wp = wp.array(pos_np.copy(),                        dtype=wp.vec3, device=device)
@@ -464,7 +676,13 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
         omega_a_wp.assign(wp.array([0.0],        dtype=float, device=device))
         angle_b_wp.assign(wp.array([angle_b[0]], dtype=float, device=device))
+        omega_cmd_wp.assign(wp.array([0.0],      dtype=float, device=device))
+        _servo_integral[0] = 0.0
+        _servo_omega_cmd[0] = 0.0
         pos0, n_wound = make_initial_positions()
+        # make_initial_positions() sets angle_a[0]/angle_b[0] to exact tangent angles — re-sync GPU.
+        angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
+        angle_b_wp.assign(wp.array([angle_b[0]], dtype=float, device=device))
         pos_wp.assign(wp.array(pos0,                              dtype=wp.vec3, device=device))
         prev_pos_wp.assign(wp.array(pos0.copy(),                  dtype=wp.vec3, device=device))
         vel_wp.assign(wp.array(np.zeros((N, 3), dtype=np.float32), dtype=wp.vec3, device=device))
@@ -506,12 +724,15 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             "roll_b_z":               float(state["roll_b_z"]),
             "roll_b_radius":          float(state["roll_b_radius"]),
             "self_collision":         int(state.get("self_collision", 1)),
+            "roll_a_servo_on":        int(state.get("roll_a_servo_on", 0)),
         }
 
     # ── Tension sensor state (independent sphere windows) ────────────────────
     # Each sensor is a sphere with independently adjustable centre and radius.
     # All particles inside the sphere contribute to the averaged tension reading.
     _sphere_centers = [np.zeros(3), np.zeros(3)]  # [upstream, downstream]
+    # Per-sensor 3×3 orientation; columns are local (X=tangent, Y, Z) axes in world.
+    _sensor_R = [np.eye(3, dtype=np.float32), np.eye(3, dtype=np.float32)]
 
     def _tension_from_mask(pp, mask):
         """Average tension (cN) over all particles in boolean mask."""
@@ -729,12 +950,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _sphere_centers[0] = sc_a
         _sphere_centers[1] = sc_b
 
-        # Box-shaped detection volume: particle inside the AABB centred on sc.
+        # Oriented box: project (p - center) onto each sensor's local axes
+        # (columns of _sensor_R) before the half-extent test.
         ha = (float(state["sensor_a_hx"]), float(state["sensor_a_hy"]), float(state["sensor_a_hz"]))
         hb = (float(state["sensor_b_hx"]), float(state["sensor_b_hy"]), float(state["sensor_b_hz"]))
-        da = np.abs(pp - sc_a);  db = np.abs(pp - sc_b)
-        mask_a = (da[:, 0] < ha[0]) & (da[:, 1] < ha[1]) & (da[:, 2] < ha[2])
-        mask_b = (db[:, 0] < hb[0]) & (db[:, 1] < hb[1]) & (db[:, 2] < hb[2])
+        la = np.abs((pp - sc_a) @ _sensor_R[0])
+        lb = np.abs((pp - sc_b) @ _sensor_R[1])
+        mask_a = (la[:, 0] < ha[0]) & (la[:, 1] < ha[1]) & (la[:, 2] < ha[2])
+        mask_b = (lb[:, 0] < hb[0]) & (lb[:, 1] < hb[1]) & (lb[:, 2] < hb[2])
 
         T_a   = _tension_from_mask(pp, mask_a)
         T_b   = _tension_from_mask(pp, mask_b)
@@ -812,16 +1035,23 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         center_b   = wp.vec3(bx, by, bz)
         orbit_r_a  = ra + r
         orbit_r_b  = rb + r
+        servo_on   = bool(int(state.get("roll_a_servo_on", 0)))
 
         for _ in range(config.SUBSTEPS):
-            roll_a_torque_step(
-                pos_wp, center_a, ra, orbit_r_a,
-                config.REST_LEN, config.STRETCH_STIFF,
-                float(state["particle_mass"]), M_a, sub_dt,
-                float(state["roll_a_bearing_damping"]),
-                float(state["roll_a_torque_scale"]),
-                200.0, angle_a_wp, omega_a_wp, device,
-            )
+            if servo_on:
+                roll_a_servo_step(
+                    pos_wp, center_a, orbit_r_a, sub_dt, 200.0,
+                    angle_a_wp, omega_a_wp, omega_cmd_wp, device,
+                )
+            else:
+                roll_a_torque_step(
+                    pos_wp, center_a, ra, orbit_r_a,
+                    config.REST_LEN, config.STRETCH_STIFF,
+                    float(state["particle_mass"]), M_a, sub_dt,
+                    float(state["roll_a_bearing_damping"]),
+                    float(state["roll_a_torque_scale"]),
+                    200.0, angle_a_wp, omega_a_wp, device,
+                )
             roll_b_motor_step(
                 pos_wp, center_b, rb, orbit_r_b,
                 float(state["pull_speed"]), sub_dt,
@@ -1030,14 +1260,17 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         [0, 4, 7], [0, 7, 3], [1, 2, 6], [1, 6, 5],
     ], dtype=np.uint32)
 
-    def _box_verts(center, hx, hy, hz):
-        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
-        return np.array([
-            [cx-hx, cy-hy, cz-hz], [cx+hx, cy-hy, cz-hz],
-            [cx+hx, cy-hy, cz+hz], [cx-hx, cy-hy, cz+hz],
-            [cx-hx, cy+hy, cz-hz], [cx+hx, cy+hy, cz-hz],
-            [cx+hx, cy+hy, cz+hz], [cx-hx, cy+hy, cz+hz],
+    def _box_verts(center, hx, hy, hz, R=None):
+        c = np.asarray(center, dtype=np.float32).reshape(3)
+        local = np.array([
+            [-hx, -hy, -hz], [ hx, -hy, -hz],
+            [ hx, -hy,  hz], [-hx, -hy,  hz],
+            [-hx,  hy, -hz], [ hx,  hy, -hz],
+            [ hx,  hy,  hz], [-hx,  hy,  hz],
         ], dtype=np.float32)
+        if R is not None:
+            local = local @ np.asarray(R, dtype=np.float32).T
+        return (local + c[None, :]).astype(np.float32)
 
     _SENSOR_A_RGB = (1.0, 0.85, 0.0)
     _SENSOR_B_RGB = (0.0, 0.85, 0.25)
@@ -1071,9 +1304,9 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
               float(state.get("sensor_b_hz", 0.05)))
         aa = float(np.clip(state.get("sensor_a_alpha", 0.4), 0.0, 1.0))
         ab = float(np.clip(state.get("sensor_b_alpha", 0.4), 0.0, 1.0))
-        sensor_box_a.set_data(vertices=_box_verts(sa, *ha), faces=_BOX_FACES,
+        sensor_box_a.set_data(vertices=_box_verts(sa, *ha, R=_sensor_R[0]), faces=_BOX_FACES,
                               color=_SENSOR_A_RGB + (aa,))
-        sensor_box_b.set_data(vertices=_box_verts(sb, *hb), faces=_BOX_FACES,
+        sensor_box_b.set_data(vertices=_box_verts(sb, *hb, R=_sensor_R[1]), faces=_BOX_FACES,
                               color=_SENSOR_B_RGB + (ab,))
         sensor_dot_a.set_data(np.array([sa], dtype=np.float32),
                               face_color=(1.0, 0.9, 0.0, 1.0), size=7, edge_width=0)
@@ -1081,6 +1314,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                               face_color=(0.0, 0.9, 0.3, 1.0), size=7, edge_width=0)
 
     _update_sensor_visuals()
+    _auto_place_sensors()   # set sensor positions from geometry at scene startup
 
     # pos=(10, 60): text renders upward from this anchor in vispy canvas coords,
     # so 3 lines of font_size=10 need ~15px each → land at y≈60, 45, 30 (all visible).
@@ -1104,8 +1338,9 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         contacts[0][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         roll_a_vis.set_data(vertices=vv, faces=ff, color=ROLL_A_COL)
-        _graph[0] = None   # obstacle GPU arrays changed — graph pointers stale
+        _graph[0] = None
         sim_reset()
+        _auto_place_sensors()
 
     def rebuild_roll_b():
         new_mesh = _cyl("roll_b_x", "roll_b_y", "roll_b_z", "roll_b_radius")
@@ -1114,6 +1349,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         roll_b_vis.set_data(vertices=vv, faces=ff, color=ROLL_B_COL)
         _graph[0] = None
         sim_reset()
+        _auto_place_sensors()
 
     def rebuild_guide():
         new_mesh = _cyl("cyl_x", "cyl_y", "cyl_z", "cyl_radius")
@@ -1121,6 +1357,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         vv, ff = mesh_for_render(new_mesh)
         cyl_vis.set_data(vertices=vv, faces=ff, color=CYL_COL)
         _graph[0] = None
+        sim_reset()
+        _auto_place_sensors()
 
     def rebuild_detect_vol():
         """Refresh the wrap-angle detection cylinder (visual only; no physics)."""
@@ -1529,10 +1767,9 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             _refresh_gizmos()
             return   # don't block camera
 
-        # Draggable: sensors + guide cylinders.  Rolls are anchor points for
-        # the yarn (particles 0 and N-1) so rebuilding them mid-sim resets
-        # state — they remain slider-only.
-        if _sel["who"] not in ("sensor_a", "sensor_b", "cyl"):
+        # All five scene objects are draggable.  Moving a roll or the guide
+        # resets the yarn to the new warped geometry; sensors just reposition.
+        if _sel["who"] not in ("sensor_a", "sensor_b", "cyl", "roll_a", "roll_b"):
             event._blocked = True
             return
         _sel["dragging"]         = True
@@ -1565,6 +1802,12 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             state["cyl_x"]  = x; state["cyl_y"]  = y; state["cyl_z"]  = z
             rebuild_guide()
             rebuild_detect_vol()
+        elif who == "roll_a":
+            state["roll_a_x"] = x; state["roll_a_y"] = y; state["roll_a_z"] = z
+            rebuild_roll_a()
+        elif who == "roll_b":
+            state["roll_b_x"] = x; state["roll_b_y"] = y; state["roll_b_z"] = z
+            rebuild_roll_b()
 
         _update_sensor_visuals()
         _refresh_gizmos()
@@ -1652,6 +1895,39 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _write_shared(pp, sim_time[0])
         _update_sensor_visuals()
 
+        # ── Roll A tension servo (PI on T_a) ─────────────────────────────────
+        servo_on = bool(int(state.get("roll_a_servo_on", 0)))
+        if servo_on and running[0]:
+            now = time.perf_counter()
+            dt_ctrl = (now - _servo_t_prev[0]) if _servo_t_prev[0] is not None else (1.0 / 60.0)
+            _servo_t_prev[0] = now
+            dt_ctrl = max(1e-4, min(dt_ctrl, 0.1))   # clamp to sane range
+
+            setp   = float(state.get("roll_a_tension_setpoint", 5.0))
+            kp     = float(state.get("roll_a_kp", 1.0))
+            ki     = float(state.get("roll_a_ki", 0.0))
+            T_a    = float(shared[0])
+            err    = setp - T_a
+
+            # Anti-windup: clamp integral so |ki · I| ≤ omega_max.
+            omega_max = 200.0
+            _servo_integral[0] += err * dt_ctrl
+            if ki > 1e-9:
+                lim = omega_max / ki
+                if _servo_integral[0] >  lim: _servo_integral[0] =  lim
+                if _servo_integral[0] < -lim: _servo_integral[0] = -lim
+
+            omega_cmd = kp * err + ki * _servo_integral[0]
+            if   omega_cmd >  omega_max: omega_cmd =  omega_max
+            elif omega_cmd < -omega_max: omega_cmd = -omega_max
+            _servo_omega_cmd[0] = omega_cmd
+            omega_cmd_wp.assign(wp.array([omega_cmd], dtype=float, device=device))
+        else:
+            _servo_t_prev[0] = None
+            # Reset integral while servo is off so re-engagement starts clean.
+            _servo_integral[0] = 0.0
+            _servo_omega_cmd[0] = 0.0
+
         # Read Roll A state from GPU once per frame (not per substep).
         _omega_a = float(omega_a_wp.numpy()[0])
         _angle_a = float(angle_a_wp.numpy()[0])
@@ -1676,6 +1952,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             )
         else:
             drag_line = "Press A or B to select sensor | D to deselect | orbit: left-drag"
+        if servo_on:
+            servo_line = (
+                f"SERVO: ON  setpt={float(state.get('roll_a_tension_setpoint', 0)):.2f}cN  "
+                f"err={(float(state.get('roll_a_tension_setpoint', 0)) - _T_a):+.2f}cN  "
+                f"ωcmd={_servo_omega_cmd[0]:+.1f} rad/s\n"
+            )
+        else:
+            servo_line = "SERVO: OFF (passive flywheel)\n"
         hud.text = (
             f"N={N}  seg={config.REST_LEN*1000:.1f}mm  r={state['ogc_r']:.3f}  "
             f"substeps={config.SUBSTEPS}  iter={config.CONSTRAINT_ITER}\n"
@@ -1685,6 +1969,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
             f"T_A={_T_a:.2f}cN  T_B={_T_b:.2f}cN  "
             f"θ={_theta:.1f}°  pred={_pred:.2f}cN  resid={_resid:.3f}\n"
+            f"{servo_line}"
             f"{drag_line}"
         )
         canvas.update()
@@ -1934,6 +2219,25 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Roll A  torque scale", "roll_a_torque_scale",    0.0, 1.0,
                DEFAULTS["roll_a_torque_scale"])
 
+    section("Roll A — tension servo (PI on T_A)")
+    _servo_on_var = tk.IntVar(value=DEFAULTS["roll_a_servo_on"])
+    _servo_on_frm = ttk.Frame(scroll_frm)
+    _servo_on_frm.pack(fill="x", padx=8, pady=3)
+    def _on_servo_toggle():
+        cmd_queue.put(("param", "roll_a_servo_on", _servo_on_var.get()))
+    ttk.Checkbutton(_servo_on_frm, text="Enable servo (overrides passive flywheel)",
+                    variable=_servo_on_var, command=_on_servo_toggle).pack(side="left")
+    param_vars["roll_a_servo_on"]      = _servo_on_var
+    param_callbacks["roll_a_servo_on"] = lambda v: (
+        _servo_on_var.set(int(v)), cmd_queue.put(("param", "roll_a_servo_on", int(v)))
+    )
+    add_slider("Tension setpoint (cN)", "roll_a_tension_setpoint", 0.0, 50.0,
+               DEFAULTS["roll_a_tension_setpoint"], fmt="{:.2f}", editable_range=True)
+    add_slider("Servo kp (rad/s per cN)", "roll_a_kp", -20.0, 20.0,
+               DEFAULTS["roll_a_kp"], fmt="{:+.3f}", editable_range=True)
+    add_slider("Servo ki (rad/s per cN·s)", "roll_a_ki", -20.0, 20.0,
+               DEFAULTS["roll_a_ki"], fmt="{:+.3f}", editable_range=True)
+
     section("Roll B — pulling roll")
     add_slider("Roll B  X",      "roll_b_x",      -3.0,  3.0, DEFAULTS["roll_b_x"],      fmt="{:+.3f}")
     add_slider("Roll B  Y",      "roll_b_y",      -3.0,  3.0, DEFAULTS["roll_b_y"],      fmt="{:+.3f}")
@@ -2060,9 +2364,9 @@ def run_ui(cmd_queue, shared, dbg_shared):
     ttk.Button(btn_frm, text="Exit", command=lambda: on_close()
                ).pack(side="left", expand=True, fill="x", padx=2)
 
-    # Auto-load params-main.json at startup so all saved preferences
+    # Auto-load default params at startup so all saved preferences
     # (including toggles) are applied without the user needing to click Load.
-    _autoload_path = os.path.join(_SCRIPT_DIR, "params-main.json")
+    _autoload_path = os.path.join(_SCRIPT_DIR, "params-main-cotton-ceramic-2.json")
     if os.path.exists(_autoload_path):
         try:
             with open(_autoload_path) as _f:
