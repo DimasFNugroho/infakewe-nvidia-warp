@@ -6,3 +6,6 @@ __pycache__/
 .eggs/
 dist/
 build/
+
+# Local LaTeX report — not for publication yet
+docs/
