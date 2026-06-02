@@ -125,6 +125,14 @@ DEFAULTS = {
     "sensor_b_alpha": 0.40,
     "sensor_b_cyl_r":    0.03,   # physical frictionless cylinder radius
     "sensor_b_cyl_enabled": 0,
+    # Yarn package (O3 feeder) — passive upstream spool with several wraps
+    "package_x":         -1.4,
+    "package_y":         -0.1,
+    "package_z":          0.0,
+    "package_radius":     0.30,
+    "package_visible":    1,    # show/hide the package mesh
+    "package_wraps":      5.0,  # wraps of bulk yarn on the package surface
+    "package_pitch_d":    1.0,  # axial pitch in units of 2r
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
@@ -173,7 +181,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                                  damp_normal_velocity, clamp_velocity,
                                  roll_a_torque_step, roll_a_servo_step,
                                  roll_b_motor_step, roll_b_torque_limited_step,
-                                 set_particle)
+                                 drum_kinematic_step, set_particle)
     from ogc.algorithm5 import SelfEEContacts, detect_self_ee
     from ogc.algorithm6 import project_self_ee, apply_self_ee_friction
     from kernels import (kernel_integrate,
@@ -190,6 +198,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     ROLL_A_COL = (0.20, 0.50, 0.90, 0.80)   # blue  — feeding roll
     ROLL_B_COL = (0.90, 0.45, 0.10, 0.80)   # orange — pulling roll
     CYL_COL    = (0.25, 0.70, 0.45, 0.75)   # green  — guide cylinder
+    PKG_COL    = (0.70, 0.50, 0.30, 0.75)   # tan    — upstream yarn package
     CYL_DET_COL = (0.50, 0.70, 0.95, 0.15)   # light blue, very translucent — wrap-detect volume
     ANCHOR_COL = (0.0,  0.83, 1.0)           # cyan marker — particle 0
     PULL_COL   = (1.0,  0.65, 0.0)           # amber marker — particle N-1
@@ -528,12 +537,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     mesh_a    = _cyl("roll_a_x",    "roll_a_y",    "roll_a_z",    "roll_a_radius")
     mesh_b    = _cyl("roll_b_x",    "roll_b_y",    "roll_b_z",    "roll_b_radius")
     mesh_mid  = _cyl("cyl_x",       "cyl_y",       "cyl_z",       "cyl_radius")
+    mesh_pkg  = _cyl("package_x",   "package_y",   "package_z",   "package_radius")
     mesh_scA  = _cyl("sensor_a_x",  "sensor_a_y",  "sensor_a_z",  "sensor_a_cyl_r")
     mesh_scB  = _cyl("sensor_b_x",  "sensor_b_y",  "sensor_b_z",  "sensor_b_cyl_r")
 
     obs_a    = ObstacleGPU(mesh_a,   device)
     obs_b    = ObstacleGPU(mesh_b,   device)
     obs_mid  = ObstacleGPU(mesh_mid, device)
+    obs_pkg  = ObstacleGPU(mesh_pkg, device)
     obs_scA  = ObstacleGPU(mesh_scA,  device)
     obs_scB  = ObstacleGPU(mesh_scB,  device)
 
@@ -566,6 +577,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     vf_a    = VFContacts(N, device);   ee_a    = EEContacts(N - 1, device)
     vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
     vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
+    vf_pkg  = VFContacts(N, device);   ee_pkg  = EEContacts(N - 1, device)
     vf_scA  = VFContacts(N, device);   ee_scA  = EEContacts(N - 1, device)
     vf_scB  = VFContacts(N, device);   ee_scB  = EEContacts(N - 1, device)
 
@@ -577,13 +589,15 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     max_disp_buf = wp.zeros(1, dtype=float,   device=device)
     _force_redetect = [True]
 
-    # contacts: Roll A (index 0, special friction), Roll B + main guide (index 1+, full friction).
+    # contacts: Roll A (index 0, special friction on free-span part only),
+    # Roll B + guide + package (index 1+, full friction).
     # frictionless_contacts: projection + normal damping only, no friction kernels.
-    # Each entry is [obstacle, vf_contacts, ee_contacts, enabled_key].
+    # Each entry is [obstacle, vf_contacts, ee_contacts].
     contacts = [
         [obs_a,   vf_a,   ee_a],
         [obs_b,   vf_b,   ee_b],
         [obs_mid, vf_mid, ee_mid],
+        [obs_pkg, vf_pkg, ee_pkg],
     ]
     frictionless_contacts = [
         [obs_scA,  vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
@@ -599,7 +613,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         nonlocal N, n_even, n_odd, n_bend, n_wound
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp, omega_b_wp, omega_cmd_wp
-        nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
+        nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, vf_pkg, ee_pkg, self_ee, contacts
         nonlocal vf_scA, ee_scA, vf_scB, ee_scB, frictionless_contacts
         nonlocal yarn_colors, pos_det_wp, max_disp_buf
 
@@ -634,6 +648,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         vf_a    = VFContacts(N, device);   ee_a    = EEContacts(N - 1, device)
         vf_b    = VFContacts(N, device);   ee_b    = EEContacts(N - 1, device)
         vf_mid  = VFContacts(N, device);   ee_mid  = EEContacts(N - 1, device)
+        vf_pkg  = VFContacts(N, device);   ee_pkg  = EEContacts(N - 1, device)
         vf_scA  = VFContacts(N, device);   ee_scA  = EEContacts(N - 1, device)
         vf_scB  = VFContacts(N, device);   ee_scB  = EEContacts(N - 1, device)
         self_ee = SelfEEContacts(N - 1, device)
@@ -642,6 +657,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             [contacts[0][0], vf_a,   ee_a],
             [contacts[1][0], vf_b,   ee_b],
             [contacts[2][0], vf_mid, ee_mid],
+            [contacts[3][0], vf_pkg, ee_pkg],
         ]
         frictionless_contacts = [
             [frictionless_contacts[0][0], vf_scA,  ee_scA,  "sensor_a_cyl_enabled"],
@@ -1245,6 +1261,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     va,   fa   = mesh_for_render(mesh_a)
     vb,   fb   = mesh_for_render(mesh_b)
     vm,   fm   = mesh_for_render(mesh_mid)
+    vpk,  fpk  = mesh_for_render(mesh_pkg)
     vsA,  fsA  = mesh_for_render(mesh_scA)
     vsB,  fsB  = mesh_for_render(mesh_scB)
 
@@ -1255,6 +1272,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     roll_a_vis  = visuals.Mesh(vertices=va,  faces=fa,  color=ROLL_A_COL,  shading="smooth", parent=view.scene)
     roll_b_vis  = visuals.Mesh(vertices=vb,  faces=fb,  color=ROLL_B_COL,  shading="smooth", parent=view.scene)
     cyl_vis     = visuals.Mesh(vertices=vm,  faces=fm,  color=CYL_COL,     shading="smooth", parent=view.scene)
+    pkg_vis     = visuals.Mesh(vertices=vpk, faces=fpk, color=PKG_COL,     shading="smooth", parent=view.scene)
+    pkg_vis.visible = bool(int(DEFAULTS["package_visible"]))
     scA_vis     = visuals.Mesh(vertices=vsA, faces=fsA, color=SCY_A_COL,   shading="smooth", parent=view.scene)
     scB_vis     = visuals.Mesh(vertices=vsB, faces=fsB, color=SCY_B_COL,   shading="smooth", parent=view.scene)
     scA_vis.visible  = bool(int(state.get("sensor_a_cyl_enabled", 0)))
@@ -1392,6 +1411,15 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         contacts[2][0] = ObstacleGPU(new_mesh, device)
         vv, ff = mesh_for_render(new_mesh)
         cyl_vis.set_data(vertices=vv, faces=ff, color=CYL_COL)
+        _graph[0] = None
+        sim_reset()
+        _auto_place_sensors()
+
+    def rebuild_package():
+        new_mesh = _cyl("package_x", "package_y", "package_z", "package_radius")
+        contacts[3][0] = ObstacleGPU(new_mesh, device)
+        vv, ff = mesh_for_render(new_mesh)
+        pkg_vis.set_data(vertices=vv, faces=ff, color=PKG_COL)
         _graph[0] = None
         sim_reset()
         _auto_place_sensors()
@@ -1896,6 +1924,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                     elif key in ("cyl_x", "cyl_y", "cyl_z", "cyl_radius"):
                         rebuild_guide()
                         rebuild_detect_vol()
+                    elif key in ("package_x", "package_y", "package_z", "package_radius"):
+                        rebuild_package()
+                    elif key == "package_visible":
+                        pkg_vis.visible = bool(int(value))
                     elif key == "cyl_detect_r":
                         rebuild_detect_vol()
                     elif key == "cyl_detect_show":
@@ -2352,6 +2384,26 @@ def run_ui(cmd_queue, shared, dbg_shared):
                DEFAULTS["roll_b_bearing_damping"])
     add_slider("Roll B  drive gain K_v",   "roll_b_drive_gain", 1.0, 500.0,
                DEFAULTS["roll_b_drive_gain"], fmt="{:.1f}", editable_range=True)
+
+    section("Yarn package (O3 upstream)")
+    add_slider("Package  X",      "package_x",      -3.0,  3.0, DEFAULTS["package_x"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Package  Y",      "package_y",      -3.0,  3.0, DEFAULTS["package_y"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Package  Z",      "package_z",      -3.0,  3.0, DEFAULTS["package_z"],      fmt="{:+.3f}", editable_range=True)
+    add_slider("Package  radius", "package_radius",  0.05, 1.0, DEFAULTS["package_radius"])
+    add_slider("Package  wraps",  "package_wraps",   0.5, 20.0, DEFAULTS["package_wraps"], fmt="{:.2f}")
+    add_slider("Package  helix pitch (×2r)", "package_pitch_d", 0.5, 4.0,
+               DEFAULTS["package_pitch_d"], fmt="{:.2f}")
+    _pkg_vis_var = tk.IntVar(value=DEFAULTS["package_visible"])
+    _pkg_vis_frm = ttk.Frame(scroll_frm)
+    _pkg_vis_frm.pack(fill="x", padx=8, pady=3)
+    def _on_pkg_vis_toggle():
+        cmd_queue.put(("param", "package_visible", _pkg_vis_var.get()))
+    ttk.Checkbutton(_pkg_vis_frm, text="Show package mesh",
+                    variable=_pkg_vis_var, command=_on_pkg_vis_toggle).pack(side="left")
+    param_vars["package_visible"]      = _pkg_vis_var
+    param_callbacks["package_visible"] = lambda v: (
+        _pkg_vis_var.set(int(v)), cmd_queue.put(("param", "package_visible", int(v)))
+    )
 
     section("Guide cylinder")
     add_slider("Guide X",      "cyl_x",      -3.0,  3.0, DEFAULTS["cyl_x"],      fmt="{:+.3f}", editable_range=True)

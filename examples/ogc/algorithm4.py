@@ -895,6 +895,63 @@ def roll_b_motor_step(
     )
 
 
+# ── Kernel: kinematic drum advance (O1/O3 feeder) ────────────────────────────
+
+@wp.kernel
+def kernel_drum_kinematic_advance(
+    pos:        wp.array(dtype=wp.vec3),
+    center:     wp.vec3,
+    orbit_r:    float,
+    angle_0:    wp.array(dtype=float),    # size-1: drum angle for the first wound particle
+    base_i:     int,                       # global index of the first wound particle
+    dtheta:     float,                     # per-particle angular step on the helix
+    dz:         float,                     # per-particle axial advance on the helix
+    n_wound:    int,
+):
+    """Position every drum-wound particle on the helix.
+
+    For thread j in [0, n_wound):
+        global_i = base_i + j
+        theta    = angle_0[0] + j * dtheta
+        pos[global_i] = center + (orbit_r * cos(theta),
+                                   orbit_r * sin(theta),
+                                   j * dz)
+
+    Used for the EFS-style rigid drum on Roll A. The base_i offset lets O3
+    place the drum's wound section in the middle of the particle array
+    (after the package wound section + transit span).
+    """
+    j = wp.tid()
+    if j >= n_wound:
+        return
+    gi    = base_i + j
+    theta = angle_0[0] + float(j) * dtheta
+    z_off = float(j) * dz
+    pos[gi] = wp.vec3(center[0] + orbit_r * wp.cos(theta),
+                      center[1] + orbit_r * wp.sin(theta),
+                      center[2] + z_off)
+
+
+def drum_kinematic_step(
+    pos:        wp.array,
+    center:     wp.vec3,
+    orbit_r:    float,
+    angle_0_wp: wp.array,
+    base_i:     int,
+    dtheta:     float,
+    dz:         float,
+    n_wound:    int,
+    device:     str,
+):
+    if n_wound <= 0:
+        return
+    wp.launch(
+        kernel_drum_kinematic_advance, dim=int(n_wound), device=device,
+        inputs=[pos, center, orbit_r, angle_0_wp,
+                int(base_i), dtheta, dz, int(n_wound)],
+    )
+
+
 # ── Kernel: torque-limited motor-driven roll B rotation ─────────────────────
 
 @wp.kernel
