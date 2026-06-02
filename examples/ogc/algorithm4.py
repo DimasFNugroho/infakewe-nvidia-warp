@@ -895,6 +895,113 @@ def roll_b_motor_step(
     )
 
 
+# ── Kernel: torque-limited motor-driven roll B rotation ─────────────────────
+
+@wp.kernel
+def kernel_roll_b_torque_limited_step(
+    pos:             wp.array(dtype=wp.vec3),
+    center:          wp.vec3,
+    rb:              float,
+    orbit_r:         float,
+    rest_len:        float,
+    stretch_stiff:   float,
+    particle_mass:   float,
+    roll_mass:       float,
+    sub_dt:          float,
+    bearing_damping: float,
+    drive_gain:      float,
+    max_torque:      float,
+    omega_max:       float,
+    target_omega:    float,
+    n_last:          int,
+    angle:           wp.array(dtype=float),   # size-1
+    omega:           wp.array(dtype=float),   # size-1
+):
+    """Single-thread kernel.
+
+    Roll B as a velocity-controlled torque-limited flywheel:
+      tau_drive = clamp(K_v * (omega_target - omega), ±tau_max)
+      tau_yarn  = r_b * |F_yarn| * |tan_comp|       (yarn opposes drive)
+      domega    = (tau_drive - sign(omega_target)*tau_yarn) / I_b · sub_dt
+      omega    *= bearing_damping
+      angle    += omega · sub_dt
+      pos[n_last] is placed on the orbit surface.
+
+    Mirrors kernel_roll_a_torque_update structurally; the difference is
+    that here the motor drives the yarn (drive torque) while yarn pull
+    acts as a load (always opposing the target-velocity direction).
+    """
+    ang     = angle[0]
+    w       = omega[0]
+    tangent = wp.vec3(-wp.sin(ang), wp.cos(ang), float(0.0))
+
+    # Yarn load from segment [n_last-1, n_last]
+    seg     = pos[n_last] - pos[n_last - 1]
+    seg_len = wp.length(seg)
+
+    tau_yarn_oppose = float(0.0)
+    if seg_len > float(1.0e-6):
+        seg_dir  = seg / seg_len
+        stretch  = wp.max(seg_len - rest_len, float(0.0))
+        tan_comp = wp.dot(seg_dir, tangent)
+        # F_yarn magnitude (PBD impulse equivalence) — always ≥ 0
+        F_mag = particle_mass * stretch_stiff * stretch / (sub_dt * sub_dt)
+        tau_yarn_oppose = rb * F_mag * wp.abs(tan_comp)
+
+    # Drive torque (clamped velocity controller)
+    tau_drive = wp.clamp(drive_gain * (target_omega - w),
+                         -max_torque, max_torque)
+
+    # Yarn opposes the intended motor direction
+    if target_omega > float(0.0):
+        tau_net = tau_drive - tau_yarn_oppose
+    elif target_omega < float(0.0):
+        tau_net = tau_drive + tau_yarn_oppose
+    else:
+        tau_net = tau_drive
+
+    # Newton on the flywheel: I_b = 1/2 · M · r_b²
+    inv_I = float(2.0) / (roll_mass * rb * rb)
+    new_omega = (w + tau_net * inv_I * sub_dt) * bearing_damping
+    new_omega = wp.clamp(new_omega, -omega_max, omega_max)
+    new_angle = ang + new_omega * sub_dt
+
+    omega[0]    = new_omega
+    angle[0]    = new_angle
+    pos[n_last] = center + wp.vec3(orbit_r * wp.cos(new_angle),
+                                    orbit_r * wp.sin(new_angle),
+                                    float(0.0))
+
+
+def roll_b_torque_limited_step(
+    pos:             wp.array,
+    center:          wp.vec3,
+    rb:              float,
+    orbit_r:         float,
+    rest_len:        float,
+    stretch_stiff:   float,
+    particle_mass:   float,
+    roll_mass:       float,
+    sub_dt:          float,
+    bearing_damping: float,
+    drive_gain:      float,
+    max_torque:      float,
+    omega_max:       float,
+    target_omega:    float,
+    n_last:          int,
+    angle_wp:        wp.array,
+    omega_wp:        wp.array,
+    device:          str,
+):
+    wp.launch(
+        kernel_roll_b_torque_limited_step, dim=1, device=device,
+        inputs=[pos, center, rb, orbit_r, rest_len, stretch_stiff,
+                particle_mass, roll_mass, sub_dt,
+                bearing_damping, drive_gain, max_torque, omega_max,
+                target_omega, n_last, angle_wp, omega_wp],
+    )
+
+
 # ── Kernel: set a single kinematic particle ───────────────────────────────────
 
 @wp.kernel

@@ -97,6 +97,12 @@ DEFAULTS = {
     "roll_b_z":          0.9090909090909092,
     "roll_b_radius":     0.15,
     "pull_speed":        5.0,   # m/s at roll B surface; negative = reverse
+    # Roll B — torque limit (DC-motor-like driven roll)
+    "roll_b_torque_limit_on":   1,        # 0 = legacy kinematic, 1 = torque-limited flywheel
+    "roll_b_max_torque":        5.0,      # N·m, motor stall torque
+    "roll_b_mass":              0.5,      # kg, sets I_b = 0.5 * M * r_b²
+    "roll_b_bearing_damping":   0.998,    # per-substep multiplicative damping
+    "roll_b_drive_gain":        50.0,     # K_v: N·m·s/rad velocity-error → drive torque
     # Tension sensor A (upstream, yellow) — place on Roll-A side of guide
     "sensor_a_x":  -0.30,  "sensor_a_y":  0.10,  "sensor_a_z":  0.00,
     # Detection volume = axis-aligned box.  Half-extents along each axis (m).
@@ -163,7 +169,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                                  apply_vf_friction, apply_ee_friction,
                                  damp_normal_velocity, clamp_velocity,
                                  roll_a_torque_step, roll_a_servo_step,
-                                 roll_b_motor_step, set_particle)
+                                 roll_b_motor_step, roll_b_torque_limited_step,
+                                 set_particle)
     from ogc.algorithm5 import SelfEEContacts, detect_self_ee
     from ogc.algorithm6 import project_self_ee, apply_self_ee_friction
     from kernels import (kernel_integrate,
@@ -533,6 +540,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
     omega_a_wp = wp.array([0.0],        dtype=float, device=device)
     angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
+    omega_b_wp = wp.array([0.0],        dtype=float, device=device)
     # Servo command (size-1 wp.array so updates from on_timer propagate through
     # a captured CUDA graph without rebuild — kernel dereferences omega_cmd[0]
     # at replay time, not capture time).
@@ -586,7 +594,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     def do_reinit(new_N: int):
         nonlocal N, n_even, n_odd, n_bend, n_wound
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
-        nonlocal angle_a_wp, omega_a_wp, angle_b_wp, omega_cmd_wp
+        nonlocal angle_a_wp, omega_a_wp, angle_b_wp, omega_b_wp, omega_cmd_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, self_ee, contacts
         nonlocal vf_scA, ee_scA, vf_scB, ee_scB, frictionless_contacts
         nonlocal yarn_colors, pos_det_wp, max_disp_buf
@@ -603,6 +611,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
         omega_a_wp = wp.array([0.0],        dtype=float, device=device)
         angle_b_wp = wp.array([angle_b[0]], dtype=float, device=device)
+        omega_b_wp = wp.array([0.0],        dtype=float, device=device)
         omega_cmd_wp = wp.array([0.0],      dtype=float, device=device)
 
         pos_np, n_wound = make_initial_positions()
@@ -676,6 +685,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
         omega_a_wp.assign(wp.array([0.0],        dtype=float, device=device))
         angle_b_wp.assign(wp.array([angle_b[0]], dtype=float, device=device))
+        omega_b_wp.assign(wp.array([0.0],        dtype=float, device=device))
         omega_cmd_wp.assign(wp.array([0.0],      dtype=float, device=device))
         _servo_integral[0] = 0.0
         _servo_omega_cmd[0] = 0.0
@@ -725,6 +735,11 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             "roll_b_radius":          float(state["roll_b_radius"]),
             "self_collision":         int(state.get("self_collision", 1)),
             "roll_a_servo_on":        int(state.get("roll_a_servo_on", 0)),
+            "roll_b_torque_limit_on": int(state.get("roll_b_torque_limit_on", 0)),
+            "roll_b_max_torque":      float(state.get("roll_b_max_torque", 5.0)),
+            "roll_b_mass":            float(state.get("roll_b_mass", 0.5)),
+            "roll_b_bearing_damping": float(state.get("roll_b_bearing_damping", 0.998)),
+            "roll_b_drive_gain":      float(state.get("roll_b_drive_gain", 50.0)),
         }
 
     # ── Tension sensor state (independent sphere windows) ────────────────────
@@ -1036,6 +1051,12 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         orbit_r_a  = ra + r
         orbit_r_b  = rb + r
         servo_on   = bool(int(state.get("roll_a_servo_on", 0)))
+        torque_limited_b = bool(int(state.get("roll_b_torque_limit_on", 0)))
+        target_omega_b   = float(state["pull_speed"]) / rb
+        M_b              = max(float(state["roll_b_mass"]), 1e-3)
+        K_v_b            = float(state["roll_b_drive_gain"])
+        tau_max_b        = float(state["roll_b_max_torque"])
+        damp_b           = float(state["roll_b_bearing_damping"])
 
         for _ in range(config.SUBSTEPS):
             if servo_on:
@@ -1052,11 +1073,21 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                     float(state["roll_a_torque_scale"]),
                     200.0, angle_a_wp, omega_a_wp, device,
                 )
-            roll_b_motor_step(
-                pos_wp, center_b, rb, orbit_r_b,
-                float(state["pull_speed"]), sub_dt,
-                N - 1, angle_b_wp, device,
-            )
+            if torque_limited_b:
+                roll_b_torque_limited_step(
+                    pos_wp, center_b, rb, orbit_r_b,
+                    config.REST_LEN, config.STRETCH_STIFF,
+                    float(state["particle_mass"]), M_b, sub_dt,
+                    damp_b, K_v_b, tau_max_b,
+                    200.0, target_omega_b,
+                    N - 1, angle_b_wp, omega_b_wp, device,
+                )
+            else:
+                roll_b_motor_step(
+                    pos_wp, center_b, rb, orbit_r_b,
+                    float(state["pull_speed"]), sub_dt,
+                    N - 1, angle_b_wp, device,
+                )
             wp.launch(kernel_integrate, dim=N, device=device,
                       inputs=[pos_wp, vel_wp, prev_pos_wp, inv_mass_wp,
                               config.GRAVITY, zero_wind, sub_dt, config.DAMPING])
@@ -1928,9 +1959,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             _servo_integral[0] = 0.0
             _servo_omega_cmd[0] = 0.0
 
-        # Read Roll A state from GPU once per frame (not per substep).
+        # Read Roll A/B state from GPU once per frame (not per substep).
         _omega_a = float(omega_a_wp.numpy()[0])
         _angle_a = float(angle_a_wp.numpy()[0])
+        _omega_b = float(omega_b_wp.numpy()[0])
 
         status     = "RUN" if running[0] else "PAUSED"
         graph_mode = "graph" if (_USE_GRAPH and _graph[0] is not None
@@ -1964,7 +1996,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             f"N={N}  seg={config.REST_LEN*1000:.1f}mm  r={state['ogc_r']:.3f}  "
             f"substeps={config.SUBSTEPS}  iter={config.CONSTRAINT_ITER}\n"
             f"pull={state['pull_speed']:+.2f} m/s  "
-            f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°\n"
+            f"ωA={_omega_a:+.1f} rad/s  θA={np.degrees(_angle_a):.0f}°  "
+            f"ωB={_omega_b:+.1f} rad/s\n"
             f"[{device}|{graph_mode}]  frame {frame[0]:05d}  {status}  "
             f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
             f"T_A={_T_a:.2f}cN  T_B={_T_b:.2f}cN  "
@@ -2244,6 +2277,28 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Roll B  Z",      "roll_b_z",      -3.0,  3.0, DEFAULTS["roll_b_z"],      fmt="{:+.3f}")
     add_slider("Roll B  radius", "roll_b_radius",  0.02, 0.5, DEFAULTS["roll_b_radius"])
     add_slider("Pull speed (m/s)", "pull_speed",  -5.0,  5.0, DEFAULTS["pull_speed"],    fmt="{:+.3f}", editable_range=True)
+
+    section("Roll B — torque limit (DC-motor-like driven roll)")
+    _tlb_var = tk.IntVar(value=DEFAULTS["roll_b_torque_limit_on"])
+    _tlb_frm = ttk.Frame(scroll_frm)
+    _tlb_frm.pack(fill="x", padx=8, pady=3)
+    def _on_tlb_toggle():
+        cmd_queue.put(("param", "roll_b_torque_limit_on", _tlb_var.get()))
+    ttk.Checkbutton(_tlb_frm,
+                    text="Enable torque limit (off = legacy kinematic motor)",
+                    variable=_tlb_var, command=_on_tlb_toggle).pack(side="left")
+    param_vars["roll_b_torque_limit_on"]      = _tlb_var
+    param_callbacks["roll_b_torque_limit_on"] = lambda v: (
+        _tlb_var.set(int(v)), cmd_queue.put(("param", "roll_b_torque_limit_on", int(v)))
+    )
+    add_slider("Roll B  max torque (N·m)", "roll_b_max_torque", 0.01, 100.0,
+               DEFAULTS["roll_b_max_torque"], fmt="{:.2f}", editable_range=True)
+    add_slider("Roll B  mass (kg)",        "roll_b_mass",       0.01,   5.0,
+               DEFAULTS["roll_b_mass"],     fmt="{:.2f}")
+    add_slider("Roll B  bearing damp",     "roll_b_bearing_damping", 0.0, 1.0,
+               DEFAULTS["roll_b_bearing_damping"])
+    add_slider("Roll B  drive gain K_v",   "roll_b_drive_gain", 1.0, 500.0,
+               DEFAULTS["roll_b_drive_gain"], fmt="{:.1f}", editable_range=True)
 
     section("Guide cylinder")
     add_slider("Guide X",      "cyl_x",      -3.0,  3.0, DEFAULTS["cyl_x"],      fmt="{:+.3f}", editable_range=True)
