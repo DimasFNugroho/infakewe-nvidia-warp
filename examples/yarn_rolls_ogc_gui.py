@@ -91,6 +91,9 @@ DEFAULTS = {
     "roll_a_tension_setpoint": 5.0,   # target upstream tension (cN)
     "roll_a_kp":               1.0,   # proportional gain (rad/s per cN)
     "roll_a_ki":               0.1,   # integral gain (rad/s per cN·s)
+    "roll_a_servo_source":     1,     # 0 = Sensor A (free-span midpoint), 1 = anchor segments (collocated)
+    "roll_a_anchor_k":         3,     # number of segments averaged for anchor tension (1..20)
+    "roll_a_tension_ewma":     0.20,  # EWMA smoothing α ∈ [0, 1]; 1 = no smoothing
     # Roll B — pulling roll
     "roll_b_x":          0.8,
     "roll_b_y":         -0.36363636363636376,
@@ -241,6 +244,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     _servo_integral  = [0.0]   # PI integral term (cN·s)
     _servo_omega_cmd = [0.0]   # last computed servo omega command (rad/s, for HUD)
     _servo_t_prev    = [None]  # perf_counter() at previous PI tick
+    _T_anchor_filt   = [0.0]   # EWMA-filtered anchor-segment tension (cN)
 
     # ── Geometry helpers ──────────────────────────────────────────────────────
 
@@ -689,6 +693,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         omega_cmd_wp.assign(wp.array([0.0],      dtype=float, device=device))
         _servo_integral[0] = 0.0
         _servo_omega_cmd[0] = 0.0
+        _T_anchor_filt[0]  = 0.0
         pos0, n_wound = make_initial_positions()
         # make_initial_positions() sets angle_a[0]/angle_b[0] to exact tangent angles — re-sync GPU.
         angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
@@ -1926,8 +1931,28 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _write_shared(pp, sim_time[0])
         _update_sensor_visuals()
 
+        # ── Anchor-segment tension (collocated feedback signal) ──────────────
+        # Mean per-segment tension over the first k segments starting at the
+        # kinematic anchor (particle 0). Uses the same PBD impulse equivalence
+        # as the sensor reading so the cN scale matches.
+        anchor_k = max(1, min(int(state.get("roll_a_anchor_k", 3)), N - 2))
+        L0       = config.REST_LEN
+        m_p      = max(float(state["particle_mass"]), 1e-6)
+        k_s      = float(state["stretch_stiff"])
+        dt_ref   = config.DT / 200.0
+        if anchor_k > 0:
+            seg = pp[1:anchor_k + 1] - pp[0:anchor_k]
+            seg_len = np.linalg.norm(seg, axis=1)
+            ext = np.maximum(seg_len - L0, 0.0)
+            T_anchor_raw = 100.0 * m_p * k_s * float(np.mean(ext)) / (dt_ref * dt_ref)
+        else:
+            T_anchor_raw = 0.0
+        alpha = float(np.clip(state.get("roll_a_tension_ewma", 0.20), 0.0, 1.0))
+        _T_anchor_filt[0] = alpha * T_anchor_raw + (1.0 - alpha) * _T_anchor_filt[0]
+
         # ── Roll A tension servo (PI on T_a) ─────────────────────────────────
-        servo_on = bool(int(state.get("roll_a_servo_on", 0)))
+        servo_on  = bool(int(state.get("roll_a_servo_on", 0)))
+        servo_src = int(state.get("roll_a_servo_source", 1))   # 0=sensor, 1=anchor
         if servo_on and running[0]:
             now = time.perf_counter()
             dt_ctrl = (now - _servo_t_prev[0]) if _servo_t_prev[0] is not None else (1.0 / 60.0)
@@ -1937,8 +1962,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             setp   = float(state.get("roll_a_tension_setpoint", 5.0))
             kp     = float(state.get("roll_a_kp", 1.0))
             ki     = float(state.get("roll_a_ki", 0.0))
-            T_a    = float(shared[0])
-            err    = setp - T_a
+            T_proc = _T_anchor_filt[0] if servo_src == 1 else float(shared[0])
+            err    = setp - T_proc
 
             # Anti-windup: clamp integral so |ki · I| ≤ omega_max.
             omega_max = 200.0
@@ -1984,10 +2009,16 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             )
         else:
             drag_line = "Press A or B to select sensor | D to deselect | orbit: left-drag"
+        src_label = "anchor" if servo_src == 1 else "sensor"
+        anchor_line = (
+            f"T_anchor={_T_anchor_filt[0]:.2f}cN (raw={T_anchor_raw:.2f})  "
+            f"src={src_label}  k={anchor_k}  α={alpha:.2f}\n"
+        )
         if servo_on:
+            T_pv = _T_anchor_filt[0] if servo_src == 1 else float(_T_a)
             servo_line = (
                 f"SERVO: ON  setpt={float(state.get('roll_a_tension_setpoint', 0)):.2f}cN  "
-                f"err={(float(state.get('roll_a_tension_setpoint', 0)) - _T_a):+.2f}cN  "
+                f"PV={T_pv:.2f}cN  err={(float(state.get('roll_a_tension_setpoint', 0)) - T_pv):+.2f}cN  "
                 f"ωcmd={_servo_omega_cmd[0]:+.1f} rad/s\n"
             )
         else:
@@ -2002,6 +2033,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             f"t={sim_time[0]:.2f}s  step={_frame_ms[0]:.1f}ms\n"
             f"T_A={_T_a:.2f}cN  T_B={_T_b:.2f}cN  "
             f"θ={_theta:.1f}°  pred={_pred:.2f}cN  resid={_resid:.3f}\n"
+            f"{anchor_line}"
             f"{servo_line}"
             f"{drag_line}"
         )
@@ -2251,6 +2283,27 @@ def run_ui(cmd_queue, shared, dbg_shared):
                DEFAULTS["roll_a_bearing_damping"])
     add_slider("Roll A  torque scale", "roll_a_torque_scale",    0.0, 1.0,
                DEFAULTS["roll_a_torque_scale"])
+
+    section("Roll A servo — measurement source")
+    _src_var = tk.IntVar(value=DEFAULTS["roll_a_servo_source"])
+    _src_frm = ttk.Frame(scroll_frm)
+    _src_frm.pack(fill="x", padx=8, pady=3)
+    def _on_src_change():
+        cmd_queue.put(("param", "roll_a_servo_source", _src_var.get()))
+    ttk.Radiobutton(_src_frm, text="Sensor A (free-span midpoint)",
+                    variable=_src_var, value=0,
+                    command=_on_src_change).pack(side="left", padx=(0, 12))
+    ttk.Radiobutton(_src_frm, text="Anchor segments (collocated)",
+                    variable=_src_var, value=1,
+                    command=_on_src_change).pack(side="left")
+    param_vars["roll_a_servo_source"]      = _src_var
+    param_callbacks["roll_a_servo_source"] = lambda v: (
+        _src_var.set(int(v)), cmd_queue.put(("param", "roll_a_servo_source", int(v)))
+    )
+    add_slider("Anchor segments averaged (k)", "roll_a_anchor_k", 1, 20,
+               DEFAULTS["roll_a_anchor_k"], is_int=True, fmt="{:d}")
+    add_slider("Tension EWMA α (1=no smoothing)", "roll_a_tension_ewma", 0.0, 1.0,
+               DEFAULTS["roll_a_tension_ewma"], fmt="{:.2f}")
 
     section("Roll A — tension servo (PI on T_A)")
     _servo_on_var = tk.IntVar(value=DEFAULTS["roll_a_servo_on"])

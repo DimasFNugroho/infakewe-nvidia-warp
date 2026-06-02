@@ -43,14 +43,19 @@
   "roll_a_bearing_damping": 0.9978401727861771,
   "roll_a_torque_scale": 1.0,
   "roll_a_servo_on": 1,
-  "roll_a_tension_setpoint": 51.28205128205128,
-  "roll_a_kp": 0.2761341222879684,
-  "roll_a_ki": 0.0013806706114398422,
+  "roll_a_tension_setpoint": 90.72978303747536,
+  "roll_a_kp": -1.0848126232741606,
+  "roll_a_ki": 0.0,
   "roll_b_x": 0.8,
   "roll_b_y": -0.36363636363636376,
   "roll_b_z": 0.9090909090909092,
   "roll_b_radius": 0.15,
   "pull_speed": -25.0,
+  "roll_b_torque_limit_on": 1,
+  "roll_b_max_torque": 1.982189349112426,
+  "roll_b_mass": 0.5,
+  "roll_b_bearing_damping": 0.998,
+  "roll_b_drive_gain": 50.0,
   "cyl_x": 0.0,
   "cyl_y": -0.32444444444444454,
   "cyl_z": -0.03111111111111109,
@@ -68,8 +73,8 @@
       1000.0
     ],
     "roll_a_kp": [
-      0.0,
-      20.0
+      -50.0,
+      0.0
     ],
     "roll_a_ki": [
       0.0,
@@ -78,6 +83,14 @@
     "pull_speed": [
       -25.0,
       5.0
+    ],
+    "roll_b_max_torque": [
+      0.01,
+      100.0
+    ],
+    "roll_b_drive_gain": [
+      1.0,
+      500.0
     ],
     "cyl_x": [
       -3.0,
