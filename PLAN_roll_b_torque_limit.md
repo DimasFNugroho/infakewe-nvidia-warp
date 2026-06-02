@@ -1,8 +1,8 @@
 # Plan: Roll B Torque-Limited Motor
 
-Branch: `roll-b/torque-limit`
-Predecessor: `master` (no dependency on the feeder branches; can land
-in parallel).
+Branch: `master` (lands directly; only the feeder options O1/O2/O3
+warrant separate branches).
+Status: implemented in commit `913e82c`.
 
 This plan addresses the downstream asymmetry called out during the
 feeder discussion: Roll B is currently a *pure kinematic motor* — it
