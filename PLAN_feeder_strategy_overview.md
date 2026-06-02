@@ -65,7 +65,7 @@ sit alongside three other plans that change the **controller** and the
 | Plan                                         | Scope                          | Status        |
 |----------------------------------------------|--------------------------------|---------------|
 | `PLAN_tension_servo_autowarp.md`             | Controller (Phase 3 PI servo)  | merged        |
-| `PLAN_collocated_anchor_feedback.md`         | Controller (where it measures) | planned       |
+| `PLAN_collocated_anchor_feedback.md`         | Controller (where it measures) | merged (8a98dc3) |
 | `PLAN_roll_b_torque_limit.md`                | Downstream plant (Roll B)      | merged (913e82c) |
 | *(forthcoming)* `PLAN_efs32_tension_window.md` | Controller (EFS-32 law)      | sketched only |
 | **This document → O1, O2, O3**               | **Upstream plant (Roll A)**    | **planned**   |
