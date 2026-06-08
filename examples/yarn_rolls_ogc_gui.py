@@ -302,30 +302,32 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     def _warp_keypoints() -> dict:
         """Single source of truth for the warp geometry of the current configuration.
 
-        Warp angle is computed purely from Roll A / guide / Roll B positions —
-        no user-supplied angle parameter.  The perpendicular-to-span criterion
-        selects the incoming and outgoing tangent sides consistent with the
-        wrap direction (CCW or CW) determined by the A-C-B cross product.
+        For O3 (two-cylinder feeder), the yarn path is:
+            Package P  ──tangent──▶  Drum A  ──tangent──▶  Guide C  ──tangent──▶  Roll B
 
-        Returns a dict with 2-D XY numpy arrays and scalars:
-          T_a_dep, T_c_in, T_c_out, T_b_arr  — orbit-surface tangent points
-          theta_in, theta_out                 — angles on the guide orbit circle
-          wrap_dir                            — +1 CCW, -1 CW
-          warp_rad                            — warp angle in radians (geometric)
-          orbit_r_a/c/b                       — orbit radii (phys radius + ogc_r)
+        Returns a dict with 2-D XY numpy arrays and scalars covering all four
+        cylinders. Existing fields retained for backwards compatibility with
+        consumers that don't care about the package.
         """
         ax, ay = float(state["roll_a_x"]), float(state["roll_a_y"])
         cx, cy = float(state["cyl_x"]),    float(state["cyl_y"])
         bx, by = float(state["roll_b_x"]), float(state["roll_b_y"])
+        px, py = float(state["package_x"]), float(state["package_y"])
         r      = float(state["ogc_r"])
-        orbit_r_a = max(float(state["roll_a_radius"]), 1e-6) + r
-        orbit_r_c = max(float(state["cyl_radius"]),    1e-6) + r
-        orbit_r_b = max(float(state["roll_b_radius"]), 1e-6) + r
+        orbit_r_p = max(float(state["package_radius"]), 1e-6) + r
+        orbit_r_a = max(float(state["roll_a_radius"]),  1e-6) + r
+        orbit_r_c = max(float(state["cyl_radius"]),     1e-6) + r
+        orbit_r_b = max(float(state["roll_b_radius"]),  1e-6) + r
 
+        C_p = np.array([px, py])
         C_a = np.array([ax, ay]); C_c = np.array([cx, cy]); C_b = np.array([bx, by])
 
-        cross_z  = (ax - cx) * (by - cy) - (ay - cy) * (bx - cx)
-        wrap_dir = +1 if cross_z < 0.0 else -1
+        # Wrap directions: each cylinder's wrap sense is set by the cross product
+        # of its predecessor → self → successor centres.
+        cross_z   = (ax - cx) * (by - cy) - (ay - cy) * (bx - cx)
+        wrap_dir  = +1 if cross_z < 0.0 else -1       # guide wrap (existing)
+        cross_z_a = (px - ax) * (cy - ay) - (py - ay) * (cx - ax)
+        wrap_dir_a = +1 if cross_z_a < 0.0 else -1    # drum wrap (O3)
 
         # Unit vectors and their 90°-CCW perpendiculars for each span
         def _unit(v):
@@ -333,11 +335,22 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             return v / n if n > 1e-9 else np.array([1.0, 0.0])
         def _perp(u): return np.array([-u[1], u[0]])
 
+        u_pa = _unit(C_a - C_p);  perp_pa = _perp(u_pa)
         u_ac = _unit(C_c - C_a);  perp_ac = _perp(u_ac)
         u_cb = _unit(C_b - C_c);  perp_cb = _perp(u_cb)
 
+        tans_pa = _external_tangent_points(C_p, orbit_r_p, C_a, orbit_r_a)
         tans_ac = _external_tangent_points(C_a, orbit_r_a, C_c, orbit_r_c)
         tans_cb = _external_tangent_points(C_c, orbit_r_c, C_b, orbit_r_b)
+
+        # P → A tangent: arriving at the drum on the wrap-dir-A side of the
+        # P → A perp (same sign criterion as the A→C / C→B selection).
+        if tans_pa:
+            T_p_dep, T_a_arr = max(tans_pa,
+                key=lambda p: -wrap_dir_a * float(np.dot(p[1] - C_a, perp_pa)))
+        else:
+            T_p_dep = C_p + orbit_r_p * u_pa
+            T_a_arr = C_a - orbit_r_a * u_pa
 
         # Incoming tangent: pick T_c_in on the -wrap_dir side of the A→C perp
         # (yarn enters guide on the side opposite to the wrap-rotation direction)
@@ -362,10 +375,23 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         theta_out = float(np.arctan2(T_c_out[1] - cy, T_c_out[0] - cx))
         warp_rad  = (wrap_dir * (theta_out - theta_in)) % (2.0 * np.pi)
 
-        return dict(T_a_dep=T_a_dep, T_c_in=T_c_in, theta_in=theta_in,
-                    theta_out=theta_out, T_c_out=T_c_out, T_b_arr=T_b_arr,
-                    wrap_dir=wrap_dir, warp_rad=warp_rad,
-                    orbit_r_a=orbit_r_a, orbit_r_c=orbit_r_c, orbit_r_b=orbit_r_b)
+        # Polar angles on the drum's orbit circle (centre A):
+        theta_a_arr = float(np.arctan2(T_a_arr[1] - ay, T_a_arr[0] - ax))
+        theta_a_dep = float(np.arctan2(T_a_dep[1] - ay, T_a_dep[0] - ax))
+
+        return dict(
+            # — A→C, C→B (existing) —
+            T_a_dep=T_a_dep, T_c_in=T_c_in, theta_in=theta_in,
+            theta_out=theta_out, T_c_out=T_c_out, T_b_arr=T_b_arr,
+            wrap_dir=wrap_dir, warp_rad=warp_rad,
+            # — P→A (O3) —
+            T_p_dep=T_p_dep, T_a_arr=T_a_arr,
+            theta_a_arr=theta_a_arr, theta_a_dep=theta_a_dep,
+            wrap_dir_a=wrap_dir_a,
+            # — orbit radii —
+            orbit_r_p=orbit_r_p, orbit_r_a=orbit_r_a,
+            orbit_r_c=orbit_r_c, orbit_r_b=orbit_r_b,
+        )
 
     def _auto_place_sensors():
         """Auto-place sensor A/B centers at span midpoints.
@@ -388,14 +414,19 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         bz = float(state["roll_b_z"])
         orbit_r_a = kp["orbit_r_a"]
 
-        # Actual last wound particle position — the yarn departs from here, not
-        # from T_a_dep (which sits at angle_a[0] before any winding advance).
-        dtheta = config.REST_LEN / orbit_r_a
-        dz_per = 2.0 * float(state["ogc_r"]) * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
-        last_theta = angle_a[0] + (n_wound - 1) * dtheta
+        # Actual last drum-wound particle position — the yarn departs the drum
+        # from here. In O3 the drum-wound block starts at drum_base and has
+        # n_wd particles, so the last drum particle is at index
+        # drum_base + n_wd - 1 (relative drum-helix index = n_wd - 1).
+        pitch_d_a   = float(state.get("roll_a_pitch_d", 1.0))
+        wrap_dir_a  = kp.get("wrap_dir_a", +1)
+        dtheta = wrap_dir_a * (config.REST_LEN / orbit_r_a)
+        dz_per = 2.0 * float(state["ogc_r"]) * pitch_d_a * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
+        n_wd_local = max(1, int(n_wd))
+        last_theta = angle_a[0] + (n_wd_local - 1) * dtheta
         dep_x = ax + orbit_r_a * np.cos(last_theta)
         dep_y = ay + orbit_r_a * np.sin(last_theta)
-        dep_z = az + (n_wound - 1) * dz_per
+        dep_z = az + (n_wd_local - 1) * dz_per
 
         T_a_dep_3d = np.array([dep_x,              dep_y,              dep_z])
         T_c_in_3d  = np.array([kp["T_c_in"][0],  kp["T_c_in"][1],  cz])
@@ -436,21 +467,33 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _sphere_centers[1] = mid_b.copy()
 
     def make_initial_positions() -> tuple:
-        """Auto-warp initial state: wound on Roll A → straight → arc on guide → straight → Roll B.
+        """O3 layout: package wraps → transit → drum wraps → A→C span → arc → C→B span.
 
-        Calls _warp_keypoints() for the tangent geometry, then distributes N
-        particles across: wound coil, free span A→guide, arc on guide, free span guide→B.
-        Also sets angle_a[0] and angle_b[0] to the exact tangent departure/arrival
-        angles so that the GPU kinematic kernels start in sync.
+        Sections, in particle-index order:
+          0 .. n_wp-1                     wound on package (free; OGC-friction held)
+          n_wp .. n_wp+n_T-1              transit span P → A
+          drum_base .. drum_base+n_wd-1   wound on drum (KINEMATIC, O1-style)
+          ... n_AC particles              A → C free span
+          ... n_arc particles             arc on guide
+          ... n_CB-1 particles            C → B free span
+          N-1                             kinematic anchor on Roll B
 
-        Returns (positions_array, n_wound).
+        angle_a[0] = drum arrival angle θ_a_arr (first drum particle's polar
+        angle on the orbit circle). The drum kernel writes the entire drum
+        block from angle_a[0] using a per-particle dθ * wrap_dir_a.
+
+        Returns (positions_array, n_wound_global, drum_base, n_wd) where
+        n_wound_global = drum_base + n_wd = particles before the post-drum
+        free span (used by friction / self-collision skip rules).
         """
         kp = _warp_keypoints()
 
         ax, ay, az = float(state["roll_a_x"]), float(state["roll_a_y"]), float(state["roll_a_z"])
         cx, cy, cz = float(state["cyl_x"]),    float(state["cyl_y"]),    float(state["cyl_z"])
         bx, by, bz = float(state["roll_b_x"]), float(state["roll_b_y"]), float(state["roll_b_z"])
+        px, py, pz = float(state["package_x"]), float(state["package_y"]), float(state["package_z"])
         r         = float(state["ogc_r"])
+        orbit_r_p = kp["orbit_r_p"]
         orbit_r_a = kp["orbit_r_a"]
         orbit_r_c = kp["orbit_r_c"]
 
@@ -458,47 +501,94 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         theta_in  = kp["theta_in"];  theta_out = kp["theta_out"]
         T_c_out   = kp["T_c_out"];   T_b_arr  = kp["T_b_arr"]
         wrap_dir  = kp["wrap_dir"];  warp_rad = kp["warp_rad"]
+        T_p_dep   = kp["T_p_dep"];   T_a_arr  = kp["T_a_arr"]
+        theta_a_arr = kp["theta_a_arr"]
+        wrap_dir_a = kp["wrap_dir_a"]
+        # Package wrap direction: default to drum's wrap_dir for visual consistency.
+        wrap_dir_p = wrap_dir_a
 
-        # ── Update kinematic angles so GPU kernels start in sync ─────────────
-        angle_a[0] = float(np.arctan2(T_a_dep[1] - ay, T_a_dep[0] - ax))
-        angle_b[0] = float(np.arctan2(T_b_arr[1] - by, T_b_arr[0] - bx))
+        # ── Wraps geometry ────────────────────────────────────────────────────
+        pitch_d_a  = float(state.get("roll_a_pitch_d", 1.0))
+        pitch_d_p  = float(state.get("package_pitch_d", 1.0))
+        n_w_a      = float(state.get("roll_a_wraps", 3.0))
+        n_w_p      = float(state.get("package_wraps", 5.0))
 
-        # ── Wound section on Roll A ───────────────────────────────────────────
-        dtheta = config.REST_LEN / orbit_r_a
-        dz     = 2.0 * r * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
+        dtheta_a_abs = config.REST_LEN / orbit_r_a
+        dz_a         = 2.0 * r * pitch_d_a * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
+        dtheta_p_abs = config.REST_LEN / orbit_r_p
+        dz_p         = 2.0 * r * pitch_d_p * config.REST_LEN / (2.0 * np.pi * orbit_r_p)
 
-        # Compute path lengths to distribute the free-span budget
+        # Particle counts for wound sections from wrap counts.
+        n_wd = int(round(2.0 * np.pi * n_w_a / dtheta_a_abs))
+        n_wp = int(round(2.0 * np.pi * n_w_p / dtheta_p_abs))
+
+        # ── Free-section path lengths (geometric) ────────────────────────────
+        T_p_dep_3d = np.array([T_p_dep[0], T_p_dep[1], pz])
+        T_a_arr_3d = np.array([T_a_arr[0], T_a_arr[1], az])
         T_c_in_3d  = np.array([T_c_in[0],  T_c_in[1],  cz])
         T_c_out_3d = np.array([T_c_out[0], T_c_out[1], cz])
         T_b_arr_3d = np.array([T_b_arr[0], T_b_arr[1], bz])
 
+        span_PA    = float(np.linalg.norm(T_a_arr - T_p_dep))
         span_AC    = float(np.linalg.norm(T_c_in  - T_a_dep))
         arc_len    = orbit_r_c * warp_rad
         span_CB    = float(np.linalg.norm(T_b_arr - T_c_out))
-        total_free = max(span_AC + arc_len + span_CB, config.REST_LEN)
+        total_free = max(span_PA + span_AC + arc_len + span_CB, config.REST_LEN)
 
-        n_free  = max(3, min(int(round(total_free / config.REST_LEN)), N - 3))
-        n_wound = N - n_free
+        # Total particle budget: clamp wraps so we keep ≥4 free particles
+        n_free_floor = 4
+        if n_wp + n_wd > N - n_free_floor:
+            avail = N - n_free_floor
+            # Scale both wraps proportionally
+            scale = avail / max(1, n_wp + n_wd)
+            n_wp = max(1, int(n_wp * scale))
+            n_wd = max(1, int(n_wd * scale))
+        n_free = N - n_wp - n_wd
+        # Distribute free particles across 4 segments proportionally
+        n_T   = max(1, min(round(n_free * span_PA  / total_free), n_free - 3))
+        n_AC  = max(1, min(round(n_free * span_AC  / total_free), n_free - n_T - 2))
+        n_arc = max(1, min(round(n_free * arc_len  / total_free), n_free - n_T - n_AC - 1))
+        n_CB  = max(1, n_free - n_T - n_AC - n_arc)
+        drum_base = n_wp + n_T
 
+        # ── Update kinematic angles so GPU kernels start in sync ─────────────
+        # Drum's first wound particle sits at θ_a_arr (yarn arrives at the drum here).
+        angle_a[0] = theta_a_arr
+        angle_b[0] = float(np.arctan2(T_b_arr[1] - by, T_b_arr[0] - bx))
+
+        # ── Section 1: package wound helix ───────────────────────────────────
+        # Place n_wp particles so the LAST one lands at T_p_dep.
+        # θ_p_last = θ_p_dep ⇒ θ_p_0 = θ_p_dep - (n_wp-1) · wrap_dir_p · dθ_p.
+        theta_p_dep = float(np.arctan2(T_p_dep[1] - py, T_p_dep[0] - px))
+        theta_p_0   = theta_p_dep - (n_wp - 1) * wrap_dir_p * dtheta_p_abs
         positions: list = []
-        for i in range(n_wound):
-            theta = angle_a[0] + i * dtheta
+        for i in range(n_wp):
+            theta = theta_p_0 + i * wrap_dir_p * dtheta_p_abs
+            positions.append([px + orbit_r_p * np.cos(theta),
+                              py + orbit_r_p * np.sin(theta),
+                              pz + i * dz_p])
+
+        # ── Section 2: transit P → A (linear from last package particle to T_a_arr) ──
+        p_pkg_end = np.array(positions[-1])
+        for i in range(1, n_T + 1):
+            t = i / n_T
+            positions.append(list(p_pkg_end + t * (T_a_arr_3d - p_pkg_end)))
+
+        # ── Section 3: drum wound helix (kinematic) ─────────────────────────
+        # First drum particle at θ_a_arr. Angles advance by wrap_dir_a · dθ_a per step.
+        for j in range(n_wd):
+            theta = theta_a_arr + j * wrap_dir_a * dtheta_a_abs
             positions.append([ax + orbit_r_a * np.cos(theta),
-                               ay + orbit_r_a * np.sin(theta),
-                               az + i * dz])
+                              ay + orbit_r_a * np.sin(theta),
+                              az + j * dz_a])
 
-        # Distribute n_free across the 3 free-span segments proportionally
-        n_AC  = max(1, min(round(n_free * span_AC  / total_free), n_free - 2))
-        n_arc = max(1, min(round(n_free * arc_len  / total_free), n_free - n_AC - 1))
-        n_CB  = max(1, n_free - n_AC - n_arc)
-
-        # Segment 1: last wound particle → guide tangent-in
-        p_dep = np.array(positions[-1])
+        # ── Section 4: A → C span (linear from last drum particle to T_c_in) ──
+        p_drum_end = np.array(positions[-1])
         for i in range(1, n_AC + 1):
             t = i / n_AC
-            positions.append(list(p_dep + t * (T_c_in_3d - p_dep)))
+            positions.append(list(p_drum_end + t * (T_c_in_3d - p_drum_end)))
 
-        # Segment 2: arc on guide orbit surface
+        # ── Section 5: arc on guide orbit surface ────────────────────────────
         for i in range(1, n_arc + 1):
             t     = i / n_arc
             theta = theta_in + wrap_dir * warp_rad * t
@@ -506,19 +596,28 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                                cy + orbit_r_c * np.sin(theta),
                                cz])
 
-        # Segment 3: guide tangent-out → Roll B
+        # ── Section 6: C → B span (linear from arc end to T_b_arr) ──────────
         p_arc_end = np.array(positions[-1])
         for i in range(1, n_CB + 1):
             t = i / n_CB
             positions.append(list(p_arc_end + t * (T_b_arr_3d - p_arc_end)))
 
-        return np.array(positions[:N], dtype=np.float32), n_wound
+        n_wound_global = drum_base + n_wd
+        return (np.array(positions[:N], dtype=np.float32),
+                n_wound_global, drum_base, n_wd)
 
     def make_inv_mass() -> np.ndarray:
         m = max(float(state["particle_mass"]), 1e-6)
         inv = np.full(N, 1.0 / m, dtype=np.float32)
-        inv[0]  = 0.0   # particle 0  kinematic — anchored to roll A
-        inv[-1] = 0.0   # particle N-1 kinematic — winding onto roll B
+        # O3: kinematic indices are particle 0 (package anchor),
+        # the drum-wound block [drum_base, drum_base+n_wd), and particle N-1
+        # (Roll B). Package wraps and free spans are dynamic.
+        nw = int(min(max(n_wound, 1), N))
+        db = int(min(max(drum_base, 0), N))
+        nwd = int(min(max(n_wound - drum_base, 0), N - db))
+        inv[0] = 0.0                              # package kinematic anchor
+        inv[db:db + nwd] = 0.0                    # drum kinematic block
+        inv[-1] = 0.0                             # Roll B kinematic
         return inv
 
     # ── Init Warp ─────────────────────────────────────────────────────────────
@@ -549,7 +648,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     obs_scB  = ObstacleGPU(mesh_scB,  device)
 
     # ── Yarn GPU arrays ───────────────────────────────────────────────────────
-    pos_np, n_wound = make_initial_positions()
+    pos_np, n_wound, drum_base, n_wd = make_initial_positions()
 
     # Roll rotational state on GPU — updated each substep by their respective kernels.
     angle_a_wp = wp.array([angle_a[0]], dtype=float, device=device)
@@ -610,7 +709,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     # next call — no changes required in _execute_substeps or sim_reset.
 
     def do_reinit(new_N: int):
-        nonlocal N, n_even, n_odd, n_bend, n_wound
+        nonlocal N, n_even, n_odd, n_bend, n_wound, drum_base, n_wd
         nonlocal pos_wp, vel_wp, prev_pos_wp, inv_mass_wp, yarn_edges_wp
         nonlocal angle_a_wp, omega_a_wp, angle_b_wp, omega_b_wp, omega_cmd_wp
         nonlocal vf_a, ee_a, vf_b, ee_b, vf_mid, ee_mid, vf_pkg, ee_pkg, self_ee, contacts
@@ -632,7 +731,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         omega_b_wp = wp.array([0.0],        dtype=float, device=device)
         omega_cmd_wp = wp.array([0.0],      dtype=float, device=device)
 
-        pos_np, n_wound = make_initial_positions()
+        pos_np, n_wound, drum_base, n_wd = make_initial_positions()
         # make_initial_positions() sets angle_a[0]/angle_b[0] to exact tangent angles — re-sync GPU.
         angle_a_wp  = wp.array([angle_a[0]], dtype=float,   device=device)
         angle_b_wp  = wp.array([angle_b[0]], dtype=float,   device=device)
@@ -698,7 +797,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     apply_state()
 
     def sim_reset():
-        nonlocal n_wound
+        nonlocal n_wound, drum_base, n_wd
         angle_b[0] = init_angle_b()
         angle_a[0] = init_angle_a()
         omega_a[0] = 0.0
@@ -710,7 +809,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _servo_integral[0] = 0.0
         _servo_omega_cmd[0] = 0.0
         _T_anchor_filt[0]  = 0.0
-        pos0, n_wound = make_initial_positions()
+        pos0, n_wound, drum_base, n_wd = make_initial_positions()
         # make_initial_positions() sets angle_a[0]/angle_b[0] to exact tangent angles — re-sync GPU.
         angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
         angle_b_wp.assign(wp.array([angle_b[0]], dtype=float, device=device))
@@ -761,6 +860,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             "roll_b_mass":            float(state.get("roll_b_mass", 0.5)),
             "roll_b_bearing_damping": float(state.get("roll_b_bearing_damping", 0.998)),
             "roll_b_drive_gain":      float(state.get("roll_b_drive_gain", 50.0)),
+            "roll_a_wraps":           float(state.get("roll_a_wraps", 3.0)),
+            "roll_a_pitch_d":         float(state.get("roll_a_pitch_d", 1.0)),
+            "package_x":              float(state.get("package_x", 0.0)),
+            "package_y":              float(state.get("package_y", 0.0)),
+            "package_z":              float(state.get("package_z", 0.0)),
+            "package_radius":         float(state.get("package_radius", 0.30)),
+            "package_wraps":          float(state.get("package_wraps", 5.0)),
+            "package_pitch_d":        float(state.get("package_pitch_d", 1.0)),
         }
 
     # ── Tension sensor state (independent sphere windows) ────────────────────
@@ -1079,11 +1186,22 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         tau_max_b        = float(state["roll_b_max_torque"])
         damp_b           = float(state["roll_b_bearing_damping"])
 
+        # O3: helix params for the drum and base index of the drum's wound
+        # block in the particle array (after the package wraps + transit).
+        pitch_d_a   = float(state.get("roll_a_pitch_d", 1.0))
+        wrap_dir_a  = +1 if ((float(state["package_x"]) - ax) * (float(state["cyl_y"]) - ay)
+                              - (float(state["package_y"]) - ay) * (float(state["cyl_x"]) - ax)) < 0.0 else -1
+        dtheta_a    = wrap_dir_a * (config.REST_LEN / orbit_r_a)
+        dz_a        = 2.0 * r * pitch_d_a * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
+        drum_base_i = int(drum_base)
+        n_wd_cap    = int(n_wd)
+
         for _ in range(config.SUBSTEPS):
             if servo_on:
                 roll_a_servo_step(
                     pos_wp, center_a, orbit_r_a, sub_dt, 200.0,
                     angle_a_wp, omega_a_wp, omega_cmd_wp, device,
+                    write_pos0=0,
                 )
             else:
                 roll_a_torque_step(
@@ -1093,7 +1211,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                     float(state["roll_a_bearing_damping"]),
                     float(state["roll_a_torque_scale"]),
                     200.0, angle_a_wp, omega_a_wp, device,
+                    write_pos0=0,
                 )
+            # Kinematic drum block: write the helix from drum_base for n_wd
+            # particles using the freshly updated angle_a[0].
+            drum_kinematic_step(
+                pos_wp, center_a, orbit_r_a, angle_a_wp,
+                drum_base_i, dtheta_a, dz_a, n_wd_cap, device,
+            )
             if torque_limited_b:
                 roll_b_torque_limited_step(
                     pos_wp, center_b, rb, orbit_r_b,
@@ -1964,21 +2089,21 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _update_sensor_visuals()
 
         # ── Anchor-segment tension (collocated feedback signal) ──────────────
-        # Mean per-segment tension over the first k segments starting at the
-        # kinematic anchor (particle 0). Uses the same PBD impulse equivalence
-        # as the sensor reading so the cN scale matches.
-        anchor_k = max(1, min(int(state.get("roll_a_anchor_k", 3)), N - 2))
-        L0       = config.REST_LEN
-        m_p      = max(float(state["particle_mass"]), 1e-6)
-        k_s      = float(state["stretch_stiff"])
-        dt_ref   = config.DT / 200.0
-        if anchor_k > 0:
-            seg = pp[1:anchor_k + 1] - pp[0:anchor_k]
-            seg_len = np.linalg.norm(seg, axis=1)
-            ext = np.maximum(seg_len - L0, 0.0)
-            T_anchor_raw = 100.0 * m_p * k_s * float(np.mean(ext)) / (dt_ref * dt_ref)
-        else:
-            T_anchor_raw = 0.0
+        # O3: anchor segment is where the yarn leaves the kinematic drum into
+        # the A→C free span — index [drum_base + n_wd - 1, drum_base + n_wd].
+        # k-segment averaging extends across the subsequent free-span segments.
+        anchor_start = max(0, n_wound - 1)
+        max_k        = max(1, N - 1 - anchor_start)
+        anchor_k     = max(1, min(int(state.get("roll_a_anchor_k", 3)), max_k))
+        L0           = config.REST_LEN
+        m_p          = max(float(state["particle_mass"]), 1e-6)
+        k_s          = float(state["stretch_stiff"])
+        dt_ref       = config.DT / 200.0
+        seg = pp[anchor_start + 1 : anchor_start + 1 + anchor_k] \
+            - pp[anchor_start     : anchor_start     + anchor_k]
+        seg_len = np.linalg.norm(seg, axis=1)
+        ext = np.maximum(seg_len - L0, 0.0)
+        T_anchor_raw = 100.0 * m_p * k_s * float(np.mean(ext)) / (dt_ref * dt_ref)
         alpha = float(np.clip(state.get("roll_a_tension_ewma", 0.20), 0.0, 1.0))
         _T_anchor_filt[0] = alpha * T_anchor_raw + (1.0 - alpha) * _T_anchor_filt[0]
 

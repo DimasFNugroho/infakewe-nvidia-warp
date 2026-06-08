@@ -741,6 +741,7 @@ def kernel_roll_a_torque_update(
     omega_max:       float,
     angle:           wp.array(dtype=float),   # size-1: current departure angle
     omega:           wp.array(dtype=float),   # size-1: current angular velocity
+    write_pos0:      int,                      # 1 = write pos[0] (legacy), 0 = O3 (skip)
 ):
     """Single-thread kernel.
 
@@ -779,9 +780,13 @@ def kernel_roll_a_torque_update(
 
     omega[0] = new_omega
     angle[0] = new_angle
-    pos[0]   = center + wp.vec3(orbit_r * wp.cos(new_angle),
-                                orbit_r * wp.sin(new_angle),
-                                float(0.0))
+    # pos[0] write is for legacy single-cylinder layouts. In O3, particle 0 is
+    # the package anchor and the drum's positions are written by
+    # drum_kinematic_step starting at base_i = drum_base.
+    if write_pos0 == 1:
+        pos[0] = center + wp.vec3(orbit_r * wp.cos(new_angle),
+                                  orbit_r * wp.sin(new_angle),
+                                  float(0.0))
 
 
 def roll_a_torque_step(
@@ -800,13 +805,14 @@ def roll_a_torque_step(
     angle_wp:        wp.array,
     omega_wp:        wp.array,
     device:          str,
+    write_pos0:      int = 1,
 ):
     wp.launch(
         kernel_roll_a_torque_update, dim=1, device=device,
         inputs=[pos, center, ra, orbit_r, rest_len, stretch_stiff,
                 particle_mass, roll_mass, sub_dt,
                 bearing_damping, torque_scale, omega_max,
-                angle_wp, omega_wp],
+                angle_wp, omega_wp, int(write_pos0)],
     )
 
 
@@ -822,16 +828,20 @@ def kernel_roll_a_servo_update(
     angle:      wp.array(dtype=float),   # size-1
     omega:      wp.array(dtype=float),   # size-1
     omega_cmd:  wp.array(dtype=float),   # size-1: external command from Python
+    write_pos0: int,                      # 1 = write pos[0] (legacy), 0 = O3 (skip)
 ):
     """Roll A as a servo: omega is forced to omega_cmd[0] (clamped), yarn torque
-    is ignored. Angle integrates omega; pos[0] tracks the surface."""
+    is ignored. Angle integrates omega; pos[0] tracks the surface in legacy
+    layouts. In O3, particle 0 is the package anchor and the drum's positions
+    are written by drum_kinematic_step starting at base_i = drum_base."""
     w = wp.clamp(omega_cmd[0], -omega_max, omega_max)
     new_angle = angle[0] + w * sub_dt
     omega[0]  = w
     angle[0]  = new_angle
-    pos[0]    = center + wp.vec3(orbit_r * wp.cos(new_angle),
-                                  orbit_r * wp.sin(new_angle),
-                                  float(0.0))
+    if write_pos0 == 1:
+        pos[0]    = center + wp.vec3(orbit_r * wp.cos(new_angle),
+                                      orbit_r * wp.sin(new_angle),
+                                      float(0.0))
 
 
 def roll_a_servo_step(
@@ -844,11 +854,12 @@ def roll_a_servo_step(
     omega_wp:   wp.array,
     omega_cmd_wp: wp.array,
     device:     str,
+    write_pos0: int = 1,
 ):
     wp.launch(
         kernel_roll_a_servo_update, dim=1, device=device,
         inputs=[pos, center, orbit_r, sub_dt, omega_max,
-                angle_wp, omega_wp, omega_cmd_wp],
+                angle_wp, omega_wp, omega_cmd_wp, int(write_pos0)],
     )
 
 
