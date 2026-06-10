@@ -75,14 +75,26 @@ DEFAULTS = {
     "ogc_r":             0.005,
     "ogc_stiff":         1.0,
     "self_ee_stiff":     0.2938856015779093,  # stiffness for yarn self-collision projection
-    "mu_static":         0.10907127429805616,
+    "mu_static":         0.10907127429805616,  # yarn↔yarn self-collision
     "mu_kinetic":        0.011879049676025918,
+    # Per-surface friction: the yarn↔surface material pairing differs on each
+    # cylinder, so package, Roll A, guide and Roll B each have their own μ pair.
+    "roll_a_mu_s":       0.10907127429805616,
+    "roll_a_mu_k":       0.011879049676025918,
+    "roll_b_mu_s":       0.10907127429805616,
+    "roll_b_mu_k":       0.011879049676025918,
+    "package_mu_s":      0.10907127429805616,
+    "package_mu_k":      0.011879049676025918,
+    "guide_mu_s":        0.10907127429805616,
+    "guide_mu_k":        0.011879049676025918,
     "v_max":             20.0,
     # Roll A — feeding roll
     "roll_a_x":         -0.8,
     "roll_a_y":          0.0,
     "roll_a_z":          0.0,
     "roll_a_radius":     0.15,
+    "roll_a_wraps":      3.0,   # wraps of yarn wound on the drum at reset
+    "roll_a_pitch_d":    1.0,   # drum helix axial pitch in units of 2r
     "roll_a_mass":       0.5219330453563715,  # kg — sets rotational inertia of roll A
     "roll_a_bearing_damping": 0.9978401727861771,  # per-substep drag on omega  [0..1]
     "roll_a_torque_scale":    1.0,                 # gain on yarn→roll torque
@@ -133,6 +145,7 @@ DEFAULTS = {
     "package_visible":    1,    # show/hide the package mesh
     "package_wraps":      5.0,  # wraps of bulk yarn on the package surface
     "package_pitch_d":    1.0,  # axial pitch in units of 2r
+    "package_speed":      0.0,  # surface speed (m/s); positive = unwind toward Roll A
     # Self-collision
     "self_collision":    1,     # 1 = yarn self-collision on, 0 = off
     "redetect_threshold": 0.3,  # fraction of r; re-run detection only when max displacement exceeds this
@@ -178,10 +191,11 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     from ogc.algorithm2 import EEContacts, detect_edge_edge
     from ogc.algorithm4 import (project_vf, project_ee,
                                  apply_vf_friction, apply_ee_friction,
+                                 apply_vf_friction_rotating_cyl,
                                  damp_normal_velocity, clamp_velocity,
                                  roll_a_torque_step, roll_a_servo_step,
                                  roll_b_motor_step, roll_b_torque_limited_step,
-                                 drum_kinematic_step, set_particle)
+                                 set_particle)
     from ogc.algorithm5 import SelfEEContacts, detect_self_ee
     from ogc.algorithm6 import project_self_ee, apply_self_ee_friction
     from kernels import (kernel_integrate,
@@ -472,19 +486,21 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         Sections, in particle-index order:
           0 .. n_wp-1                     wound on package (free; OGC-friction held)
           n_wp .. n_wp+n_T-1              transit span P → A
-          drum_base .. drum_base+n_wd-1   wound on drum (KINEMATIC, O1-style)
+          drum_base .. drum_base+n_wd-1   wound on drum (free; OGC-friction held)
           ... n_AC particles              A → C free span
           ... n_arc particles             arc on guide
           ... n_CB-1 particles            C → B free span
           N-1                             kinematic anchor on Roll B
 
         angle_a[0] = drum arrival angle θ_a_arr (first drum particle's polar
-        angle on the orbit circle). The drum kernel writes the entire drum
-        block from angle_a[0] using a per-particle dθ * wrap_dir_a.
+        angle on the orbit circle); it only seeds Roll A's rotational state —
+        the wound particles themselves are free and held by OGC contact +
+        rotating-surface friction, like the guide.
 
         Returns (positions_array, n_wound_global, drum_base, n_wd) where
         n_wound_global = drum_base + n_wd = particles before the post-drum
-        free span (used by friction / self-collision skip rules).
+        free span (used by the torque departure segment and the
+        self-collision skip rule).
         """
         kp = _warp_keypoints()
 
@@ -574,7 +590,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             t = i / n_T
             positions.append(list(p_pkg_end + t * (T_a_arr_3d - p_pkg_end)))
 
-        # ── Section 3: drum wound helix (kinematic) ─────────────────────────
+        # ── Section 3: drum wound helix (free particles) ─────────────────────
         # First drum particle at θ_a_arr. Angles advance by wrap_dir_a · dθ_a per step.
         for j in range(n_wd):
             theta = theta_a_arr + j * wrap_dir_a * dtheta_a_abs
@@ -609,14 +625,12 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     def make_inv_mass() -> np.ndarray:
         m = max(float(state["particle_mass"]), 1e-6)
         inv = np.full(N, 1.0 / m, dtype=np.float32)
-        # O3: kinematic indices are particle 0 (package anchor),
-        # the drum-wound block [drum_base, drum_base+n_wd), and particle N-1
-        # (Roll B). Package wraps and free spans are dynamic.
-        nw = int(min(max(n_wound, 1), N))
-        db = int(min(max(drum_base, 0), N))
-        nwd = int(min(max(n_wound - drum_base, 0), N - db))
-        inv[0] = 0.0                              # package kinematic anchor
-        inv[db:db + nwd] = 0.0                    # drum kinematic block
+        # O3: only particle N-1 (Roll B wind-up anchor) is kinematic.  Package
+        # and drum wound blocks are FREE: like the guide, the yarn is held on
+        # those surfaces by OGC contact + Coulomb friction only, with the
+        # rotating-surface friction kernel coupling each block to its
+        # cylinder's angular velocity.  A space-pinned package anchor would
+        # fight the rotating spool surface, so the yarn start is free too.
         inv[-1] = 0.0                             # Roll B kinematic
         return inv
 
@@ -659,6 +673,13 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     # a captured CUDA graph without rebuild — kernel dereferences omega_cmd[0]
     # at replay time, not capture time).
     omega_cmd_wp = wp.array([0.0], dtype=float, device=device)
+    # Package surface angular velocity (rad/s) — size-1 wp.array so slider
+    # changes propagate through the captured CUDA graph without rebuild.
+    # The package is a driven spool: its prescribed rotation drags the wound
+    # yarn via the same rotating-surface friction model as Roll A.
+    omega_p_wp   = wp.array([0.0], dtype=float, device=device)
+    omega_p_host = [0.0]   # host mirror, integrates the visual spin marker
+    angle_p_vis  = [0.0]   # integrated package angle (visual only)
 
     pos_wp      = wp.array(pos_np,                              dtype=wp.vec3, device=device)
     vel_wp      = wp.array(np.zeros((N, 3), dtype=np.float32), dtype=wp.vec3, device=device)
@@ -796,6 +817,25 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
 
     apply_state()
 
+    def _set_pkg_omega():
+        """package_speed (m/s at the spool surface) → signed omega_p (rad/s).
+
+        Sign convention matches the helix wrap direction so that positive
+        package_speed advances the wound yarn toward its departure tangent,
+        i.e. unwinds it toward Roll A.
+        """
+        ax, ay = float(state["roll_a_x"]),  float(state["roll_a_y"])
+        cx, cy = float(state["cyl_x"]),     float(state["cyl_y"])
+        px, py = float(state["package_x"]), float(state["package_y"])
+        cross_z_a  = (px - ax) * (cy - ay) - (py - ay) * (cx - ax)
+        wrap_dir_p = +1.0 if cross_z_a < 0.0 else -1.0
+        rp    = max(float(state["package_radius"]), 1e-6)
+        omega = wrap_dir_p * float(state.get("package_speed", 0.0)) / rp
+        omega_p_host[0] = omega
+        omega_p_wp.assign(wp.array([omega], dtype=float, device=device))
+
+    _set_pkg_omega()
+
     def sim_reset():
         nonlocal n_wound, drum_base, n_wd
         angle_b[0] = init_angle_b()
@@ -819,6 +859,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         inv_mass_wp.assign(wp.array(make_inv_mass(),               dtype=float,   device=device))
         sim_time[0] = 0.0
         frame[0]    = 0
+        angle_p_vis[0] = 0.0
+        _set_pkg_omega()
         _force_redetect[0] = True
 
     # ── Shared substep body ───────────────────────────────────────────────────
@@ -839,6 +881,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             "self_ee_stiff":          float(state.get("self_ee_stiff", 0.3)),
             "mu_static":              float(state["mu_static"]),
             "mu_kinetic":             float(state["mu_kinetic"]),
+            "roll_a_mu_s":            float(state.get("roll_a_mu_s",  0.0)),
+            "roll_a_mu_k":            float(state.get("roll_a_mu_k",  0.0)),
+            "roll_b_mu_s":            float(state.get("roll_b_mu_s",  0.0)),
+            "roll_b_mu_k":            float(state.get("roll_b_mu_k",  0.0)),
+            "package_mu_s":           float(state.get("package_mu_s", 0.0)),
+            "package_mu_k":           float(state.get("package_mu_k", 0.0)),
+            "guide_mu_s":             float(state.get("guide_mu_s",   0.0)),
+            "guide_mu_k":             float(state.get("guide_mu_k",   0.0)),
             "v_max":                  float(state["v_max"]),
             "pull_speed":             float(state["pull_speed"]),
             "particle_mass":          float(state["particle_mass"]),
@@ -1106,7 +1156,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         T_b   = _tension_from_mask(pp, mask_b)
         dbg   = {}
         theta, n_contact = _wrap_angle_contacts(pp, dbg=dbg)
-        mu_k  = float(state["mu_kinetic"])
+        # Capstan prediction across the GUIDE wrap → use the guide's μ_k.
+        mu_k  = float(state.get("guide_mu_k", state["mu_kinetic"]))
         capstan_pred = T_a * np.exp(mu_k * theta)
         residual     = (T_b / capstan_pred) if capstan_pred > 1e-9 else 0.0
         # shared layout: [T_a, T_b, theta_deg, capstan_pred, residual, sim_time, n_contact]
@@ -1162,8 +1213,16 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         r             = float(state["ogc_r"])
         stiff         = float(state["ogc_stiff"])
         self_ee_stiff = float(state.get("self_ee_stiff", 0.3))
-        mu_s          = float(state["mu_static"])
+        mu_s          = float(state["mu_static"])    # yarn ↔ yarn
         mu_k          = float(state["mu_kinetic"])
+        mu_s_a        = float(state.get("roll_a_mu_s",  mu_s))   # yarn ↔ drum
+        mu_k_a        = float(state.get("roll_a_mu_k",  mu_k))
+        mu_s_b        = float(state.get("roll_b_mu_s",  mu_s))   # yarn ↔ Roll B
+        mu_k_b        = float(state.get("roll_b_mu_k",  mu_k))
+        mu_s_p        = float(state.get("package_mu_s", mu_s))   # yarn ↔ package
+        mu_k_p        = float(state.get("package_mu_k", mu_k))
+        mu_s_g        = float(state.get("guide_mu_s",   mu_s))   # yarn ↔ guide
+        mu_k_g        = float(state.get("guide_mu_k",   mu_k))
         v_max         = float(state["v_max"])
         self_coll_on  = bool(int(state.get("self_collision", 1)))
         zero_wind     = wp.vec3(0.0, 0.0, 0.0)
@@ -1186,15 +1245,13 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         tau_max_b        = float(state["roll_b_max_torque"])
         damp_b           = float(state["roll_b_bearing_damping"])
 
-        # O3: helix params for the drum and base index of the drum's wound
-        # block in the particle array (after the package wraps + transit).
-        pitch_d_a   = float(state.get("roll_a_pitch_d", 1.0))
-        wrap_dir_a  = +1 if ((float(state["package_x"]) - ax) * (float(state["cyl_y"]) - ay)
-                              - (float(state["package_y"]) - ay) * (float(state["cyl_x"]) - ax)) < 0.0 else -1
-        dtheta_a    = wrap_dir_a * (config.REST_LEN / orbit_r_a)
-        dz_a        = 2.0 * r * pitch_d_a * config.REST_LEN / (2.0 * np.pi * orbit_r_a)
-        drum_base_i = int(drum_base)
-        n_wd_cap    = int(n_wd)
+        # O3: departure segment of the drum-wound block — last initially wound
+        # particle → first A→C free-span particle.  The torque kernel reads its
+        # stretch to estimate the load torque the yarn exerts on Roll A.
+        seg_i_a = int(min(max(n_wound - 1, 0), N - 2))
+        # Package contact-surface radius for the rotating-friction kernel
+        # (omega itself is read from omega_p_wp at replay time, not baked).
+        orbit_r_p = max(float(state["package_radius"]), 1e-6) + r
 
         for _ in range(config.SUBSTEPS):
             if servo_on:
@@ -1211,14 +1268,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                     float(state["roll_a_bearing_damping"]),
                     float(state["roll_a_torque_scale"]),
                     200.0, angle_a_wp, omega_a_wp, device,
-                    write_pos0=0,
+                    write_pos0=0, seg_i=seg_i_a,
                 )
-            # Kinematic drum block: write the helix from drum_base for n_wd
-            # particles using the freshly updated angle_a[0].
-            drum_kinematic_step(
-                pos_wp, center_a, orbit_r_a, angle_a_wp,
-                drum_base_i, dtheta_a, dz_a, n_wd_cap, device,
-            )
             if torque_limited_b:
                 roll_b_torque_limited_step(
                     pos_wp, center_b, rb, orbit_r_b,
@@ -1266,19 +1317,40 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                 if self_coll_on:
                     project_self_ee(pos_wp, inv_mass_wp, yarn_edges_wp,
                                     self_ee, r, self_ee_stiff, device)
-            # Roll A (contacts[0]): friction only on free-span particles.
+            # Roll A (contacts[0]): rotating-surface friction — wound particles
+            # are free and the drum's angular velocity (omega_a, updated on the
+            # GPU each substep) sets the friction reference frame, so a turning
+            # drum drags the wrapped yarn with it (Capstan drive).
             obs_a_entry, vf_a_cur, ee_a_cur = contacts[0]
-            apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
-                              vf_a_cur, r, mu_s, mu_k, device,
-                              min_idx=n_wound)
+            apply_vf_friction_rotating_cyl(
+                pos_wp, prev_pos_wp, inv_mass_wp,
+                vf_a_cur, r, mu_s_a, mu_k_a,
+                omega_a_wp, orbit_r_a, sub_dt, device,
+            )
             apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
-                              yarn_edges_wp, ee_a_cur, r, mu_s, mu_k, device,
-                              min_idx=max(0, n_wound - 1))
-            for obs, vf, ee in contacts[1:]:
-                apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
-                                  vf, r, mu_s, mu_k, device)
-                apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
-                                  yarn_edges_wp, ee, r, mu_s, mu_k, device)
+                              yarn_edges_wp, ee_a_cur, r, mu_s_a, mu_k_a, device)
+            # Roll B (contacts[1]): static-surface friction, Roll-B-specific μ.
+            _, vf_b_cur, ee_b_cur = contacts[1]
+            apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              vf_b_cur, r, mu_s_b, mu_k_b, device)
+            apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              yarn_edges_wp, ee_b_cur, r, mu_s_b, mu_k_b, device)
+            # Guide (contacts[2]): static-surface friction, guide-specific μ.
+            _, vf_g_cur, ee_g_cur = contacts[2]
+            apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              vf_g_cur, r, mu_s_g, mu_k_g, device)
+            apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              yarn_edges_wp, ee_g_cur, r, mu_s_g, mu_k_g, device)
+            # Package (contacts[3]): driven spool — rotating-surface friction
+            # at omega_p drags the wound yarn off (or onto) the package.
+            _, vf_pkg_cur, ee_pkg_cur = contacts[3]
+            apply_vf_friction_rotating_cyl(
+                pos_wp, prev_pos_wp, inv_mass_wp,
+                vf_pkg_cur, r, mu_s_p, mu_k_p,
+                omega_p_wp, orbit_r_p, sub_dt, device,
+            )
+            apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
+                              yarn_edges_wp, ee_pkg_cur, r, mu_s_p, mu_k_p, device)
             if self_coll_on:
                 apply_self_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                        yarn_edges_wp, self_ee, r, mu_s, mu_k, device)
@@ -1399,6 +1471,26 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     cyl_vis     = visuals.Mesh(vertices=vm,  faces=fm,  color=CYL_COL,     shading="smooth", parent=view.scene)
     pkg_vis     = visuals.Mesh(vertices=vpk, faces=fpk, color=PKG_COL,     shading="smooth", parent=view.scene)
     pkg_vis.visible = bool(int(DEFAULTS["package_visible"]))
+
+    # Spin marker: a radial pin poking out of the package surface, rotated by
+    # the integrated package angle so the spool's rotation is visible (the
+    # smooth-shaded uniform-colour mesh itself shows no rotation).
+    pkg_spoke = visuals.Line(pos=np.zeros((2, 3), dtype=np.float32),
+                             color=(1.0, 1.0, 1.0, 0.9), width=5,
+                             connect="segments", parent=view.scene)
+
+    def _update_pkg_spoke():
+        px_, py_, pz_ = (float(state["package_x"]), float(state["package_y"]),
+                         float(state["package_z"]))
+        rp_ = float(state["package_radius"])
+        c, s = np.cos(angle_p_vis[0]), np.sin(angle_p_vis[0])
+        pts = np.array([[px_ + 0.95 * rp_ * c, py_ + 0.95 * rp_ * s, pz_],
+                        [px_ + 1.30 * rp_ * c, py_ + 1.30 * rp_ * s, pz_]],
+                       dtype=np.float32)
+        pkg_spoke.set_data(pos=pts)
+        pkg_spoke.visible = pkg_vis.visible
+
+    _update_pkg_spoke()
     scA_vis     = visuals.Mesh(vertices=vsA, faces=fsA, color=SCY_A_COL,   shading="smooth", parent=view.scene)
     scB_vis     = visuals.Mesh(vertices=vsB, faces=fsB, color=SCY_B_COL,   shading="smooth", parent=view.scene)
     scA_vis.visible  = bool(int(state.get("sensor_a_cyl_enabled", 0)))
@@ -1609,9 +1701,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         if who == "sensor_b":
             return np.array(_sphere_centers[1], dtype=float)
         key_map = {
-            "roll_a": ("roll_a_x", "roll_a_y", "roll_a_z"),
-            "roll_b": ("roll_b_x", "roll_b_y", "roll_b_z"),
-            "cyl":    ("cyl_x",    "cyl_y",    "cyl_z"),
+            "roll_a":  ("roll_a_x",  "roll_a_y",  "roll_a_z"),
+            "roll_b":  ("roll_b_x",  "roll_b_y",  "roll_b_z"),
+            "cyl":     ("cyl_x",     "cyl_y",     "cyl_z"),
+            "package": ("package_x", "package_y", "package_z"),
         }
         kx, ky, kz = key_map[who]
         return np.array([state[kx], state[ky], state[kz]], dtype=float)
@@ -1867,6 +1960,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             ((state["cyl_x"], state["cyl_y"], state["cyl_z"]),
                 float(state["cyl_radius"]), "cyl", "cyl"),
         ]
+        if bool(int(state.get("package_visible", 1))):
+            objects.append(
+                ((state["package_x"], state["package_y"], state["package_z"]),
+                 float(state["package_radius"]), "package", "cyl"))
 
         candidates = []  # (t, name, center, geom_data, shape)
         for center, geom_data, name, shape in objects:
@@ -1956,9 +2053,11 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             _refresh_gizmos()
             return   # don't block camera
 
-        # All five scene objects are draggable.  Moving a roll or the guide
-        # resets the yarn to the new warped geometry; sensors just reposition.
-        if _sel["who"] not in ("sensor_a", "sensor_b", "cyl", "roll_a", "roll_b"):
+        # All six scene objects are draggable.  Moving a roll, the guide or the
+        # package resets the yarn to the new warped geometry; sensors just
+        # reposition.
+        if _sel["who"] not in ("sensor_a", "sensor_b", "cyl",
+                               "roll_a", "roll_b", "package"):
             event._blocked = True
             return
         _sel["dragging"]         = True
@@ -1997,6 +2096,9 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         elif who == "roll_b":
             state["roll_b_x"] = x; state["roll_b_y"] = y; state["roll_b_z"] = z
             rebuild_roll_b()
+        elif who == "package":
+            state["package_x"] = x; state["package_y"] = y; state["package_z"] = z
+            rebuild_package()
 
         _update_sensor_visuals()
         _refresh_gizmos()
@@ -2051,6 +2153,18 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                         rebuild_detect_vol()
                     elif key in ("package_x", "package_y", "package_z", "package_radius"):
                         rebuild_package()
+                    elif key in ("roll_a_wraps", "roll_a_pitch_d",
+                                 "package_wraps", "package_pitch_d"):
+                        # Wraps/pitch only shape the initial layout — re-layout
+                        # the yarn; the graph rebuilds via the param snapshot
+                        # (n_wound / departure segment are baked into it).
+                        _graph[0] = None
+                        sim_reset()
+                        _auto_place_sensors()
+                    elif key == "package_speed":
+                        # Live update: omega_p_wp is dereferenced at graph
+                        # replay time, so no rebuild or reset is needed.
+                        _set_pkg_omega()
                     elif key == "package_visible":
                         pkg_vis.visible = bool(int(value))
                     elif key == "cyl_detect_r":
@@ -2078,6 +2192,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         if running[0]:
             sim_step()
             frame[0] += 1
+            angle_p_vis[0] += omega_p_host[0] * config.DT
+        _update_pkg_spoke()
 
         pp = pos_wp.numpy()
         col = compute_stretch_colors(pp) if state.get("heatmap_mode") else yarn_colors
@@ -2089,7 +2205,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _update_sensor_visuals()
 
         # ── Anchor-segment tension (collocated feedback signal) ──────────────
-        # O3: anchor segment is where the yarn leaves the kinematic drum into
+        # O3: anchor segment is where the yarn leaves the drum-wound block into
         # the A→C free span — index [drum_base + n_wd - 1, drum_base + n_wd].
         # k-segment averaging extends across the subsequent free-span segments.
         anchor_start = max(0, n_wound - 1)
@@ -2370,8 +2486,8 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Contact radius r (m)", "ogc_r",        0.001, 0.20, DEFAULTS["ogc_r"],      fmt="{:.4f}")
     param_vars["ogc_r"].trace_add("write", lambda *_: _update_n_label())
     add_slider("Contact stiffness",    "ogc_stiff",    0.0,   1.0,  DEFAULTS["ogc_stiff"])
-    add_slider("Friction μ_static",    "mu_static",    0.0,   1.0,  DEFAULTS["mu_static"])
-    add_slider("Friction μ_kinetic",   "mu_kinetic",   0.0,   1.0,  DEFAULTS["mu_kinetic"], editable_range=True)
+    add_slider("μ_static  (yarn↔yarn)",  "mu_static",  0.0, 1.0, DEFAULTS["mu_static"])
+    add_slider("μ_kinetic (yarn↔yarn)",  "mu_kinetic", 0.0, 1.0, DEFAULTS["mu_kinetic"], editable_range=True)
     add_slider("Velocity max (m/s)",   "v_max",        0.0,  100.0, DEFAULTS["v_max"],       fmt="{:.1f}")
 
     section("Yarn self-collision")
@@ -2435,6 +2551,12 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Roll A  Y",       "roll_a_y",      -3.0,  3.0,  DEFAULTS["roll_a_y"],      fmt="{:+.3f}")
     add_slider("Roll A  Z",       "roll_a_z",      -3.0,  3.0,  DEFAULTS["roll_a_z"],      fmt="{:+.3f}")
     add_slider("Roll A  radius",  "roll_a_radius",  0.02, 0.5,  DEFAULTS["roll_a_radius"])
+    add_slider("Roll A  wraps",   "roll_a_wraps",   0.5, 20.0,  DEFAULTS["roll_a_wraps"], fmt="{:.2f}")
+    add_slider("Roll A  helix pitch (×2r)", "roll_a_pitch_d", 0.5, 4.0,
+               DEFAULTS["roll_a_pitch_d"], fmt="{:.2f}")
+    add_slider("Roll A  μ_static",  "roll_a_mu_s", 0.0, 1.0, DEFAULTS["roll_a_mu_s"])
+    add_slider("Roll A  μ_kinetic", "roll_a_mu_k", 0.0, 1.0, DEFAULTS["roll_a_mu_k"],
+               editable_range=True)
     add_slider("Roll A  mass (kg)", "roll_a_mass",  0.01, 5.0,  DEFAULTS["roll_a_mass"])
     add_slider("Roll A  bearing damp", "roll_a_bearing_damping", 0.0, 1.0,
                DEFAULTS["roll_a_bearing_damping"])
@@ -2486,6 +2608,9 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Roll B  Y",      "roll_b_y",      -3.0,  3.0, DEFAULTS["roll_b_y"],      fmt="{:+.3f}")
     add_slider("Roll B  Z",      "roll_b_z",      -3.0,  3.0, DEFAULTS["roll_b_z"],      fmt="{:+.3f}")
     add_slider("Roll B  radius", "roll_b_radius",  0.02, 0.5, DEFAULTS["roll_b_radius"])
+    add_slider("Roll B  μ_static",  "roll_b_mu_s", 0.0, 1.0, DEFAULTS["roll_b_mu_s"])
+    add_slider("Roll B  μ_kinetic", "roll_b_mu_k", 0.0, 1.0, DEFAULTS["roll_b_mu_k"],
+               editable_range=True)
     add_slider("Pull speed (m/s)", "pull_speed",  -5.0,  5.0, DEFAULTS["pull_speed"],    fmt="{:+.3f}", editable_range=True)
 
     section("Roll B — torque limit (DC-motor-like driven roll)")
@@ -2518,6 +2643,11 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Package  wraps",  "package_wraps",   0.5, 20.0, DEFAULTS["package_wraps"], fmt="{:.2f}")
     add_slider("Package  helix pitch (×2r)", "package_pitch_d", 0.5, 4.0,
                DEFAULTS["package_pitch_d"], fmt="{:.2f}")
+    add_slider("Package  surface speed (m/s)", "package_speed", -5.0, 5.0,
+               DEFAULTS["package_speed"], fmt="{:+.2f}", editable_range=True)
+    add_slider("Package  μ_static",  "package_mu_s", 0.0, 1.0, DEFAULTS["package_mu_s"])
+    add_slider("Package  μ_kinetic", "package_mu_k", 0.0, 1.0, DEFAULTS["package_mu_k"],
+               editable_range=True)
     _pkg_vis_var = tk.IntVar(value=DEFAULTS["package_visible"])
     _pkg_vis_frm = ttk.Frame(scroll_frm)
     _pkg_vis_frm.pack(fill="x", padx=8, pady=3)
@@ -2535,6 +2665,9 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Guide Y",      "cyl_y",      -3.0,  3.0, DEFAULTS["cyl_y"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide Z",      "cyl_z",      -3.0,  3.0, DEFAULTS["cyl_z"],      fmt="{:+.3f}", editable_range=True)
     add_slider("Guide radius", "cyl_radius",  0.02, 0.5, DEFAULTS["cyl_radius"])
+    add_slider("Guide μ_static",  "guide_mu_s", 0.0, 1.0, DEFAULTS["guide_mu_s"])
+    add_slider("Guide μ_kinetic", "guide_mu_k", 0.0, 1.0, DEFAULTS["guide_mu_k"],
+               editable_range=True)
     add_slider("Wrap-detect radius (m)", "cyl_detect_r", 0.05, 1.0,
                DEFAULTS["cyl_detect_r"], fmt="{:.3f}")
     _cyl_det_show_var = tk.IntVar(value=DEFAULTS["cyl_detect_show"])
@@ -2651,7 +2784,7 @@ def run_ui(cmd_queue, shared, dbg_shared):
 
     # Auto-load default params at startup so all saved preferences
     # (including toggles) are applied without the user needing to click Load.
-    _autoload_path = os.path.join(_SCRIPT_DIR, "params-main-cotton-ceramic-2.json")
+    _autoload_path = os.path.join(_SCRIPT_DIR, "params-main.json")
     if os.path.exists(_autoload_path):
         try:
             with open(_autoload_path) as _f:
@@ -2809,7 +2942,8 @@ def run_ui(cmd_queue, shared, dbg_shared):
         T_a    = shared[0];  T_b   = shared[1]
         theta  = shared[2];  pred  = shared[3];  resid = shared[4]
         n_ctc  = int(shared[6])
-        mu_k   = float(param_vars.get("mu_kinetic", tk.DoubleVar(value=0.0)).get())
+        # Capstan readout spans the guide wrap → show the guide's μ_k.
+        mu_k   = float(param_vars.get("guide_mu_k", tk.DoubleVar(value=0.0)).get())
         theta_r = math.radians(theta)
         _info_var.set(
             f"T_A = {T_a:7.3f} cN  (upstream,  yellow)      "

@@ -174,6 +174,104 @@ def kernel_vf_friction(
         pos[i] = pos[i] - delta_t * scale                                # kinetic
 
 
+# ── Kernel: Coulomb friction against a rotating cylinder surface ─────────────
+# Same cone rule as kernel_vf_friction but the reference frame is the moving
+# surface.  Slip = particle tangential displacement − surface displacement.
+# Sticking means the particle moves WITH the rotating surface, which is exactly
+# the Capstan drag that drives wound yarn off a rotating spool.
+#
+# surf_omega is a size-1 wp.array (not a Python scalar) so a value updated on
+# the GPU each substep — e.g. omega_a from roll_a_torque_step — drives the
+# surface inside a captured CUDA graph.
+
+@wp.kernel
+def kernel_vf_friction_rotating_cyl(
+    pos:        wp.array(dtype=wp.vec3),
+    prev_pos:   wp.array(dtype=wp.vec3),
+    inv_mass:   wp.array(dtype=float),
+    vf_active:  wp.array(dtype=int),
+    vf_dist:    wp.array(dtype=float),
+    vf_normal:  wp.array(dtype=wp.vec3),
+    r:          float,
+    mu_s:       float,
+    mu_k:       float,
+    min_idx:    int,
+    surf_omega: wp.array(dtype=float),   # size-1: angular velocity (rad/s), +CCW about +Z
+    orbit_r:    float,                    # contact-surface radius = cyl_r + ogc_r
+    sub_dt:     float,
+):
+    """Coulomb friction against a cylinder rotating about its axis (+Z).
+
+    For each contacting particle the surface tangent at the contact normal n is
+        t_surf = normalize(Z × n) = (-n.y, n.x, 0)
+    The surface displacement per substep is
+        s = surf_omega[0] * orbit_r * sub_dt * t_surf
+    Slip is the particle tangential displacement minus s.  Within the static
+    cone the particle sticks (moves with the surface); outside, kinetic scaling.
+    """
+    i = wp.tid()
+    if i < min_idx:
+        return
+    if inv_mass[i] == 0.0:
+        return
+    if vf_active[i] == 0:
+        return
+    if vf_dist[i] >= r:
+        return
+
+    penetration  = r - vf_dist[i]
+    correction_n = wp.max(penetration, r * float(0.5))
+
+    n       = vf_normal[i]
+    delta   = pos[i] - prev_pos[i]
+    delta_t = delta - n * wp.dot(delta, n)
+
+    # Surface tangent for a cylinder with Z axis: t = Z × n = (-ny, nx, 0).
+    # Already unit-length when n is a horizontal unit vector; guard degenerate.
+    tx = -n[1];  ty = n[0]
+    t_len = wp.sqrt(tx * tx + ty * ty)
+    if t_len > float(1.0e-6):
+        s_mag = surf_omega[0] * orbit_r * sub_dt / t_len
+        surf_disp = wp.vec3(tx * s_mag, ty * s_mag, float(0.0))
+    else:
+        surf_disp = wp.vec3(float(0.0), float(0.0), float(0.0))
+
+    slip     = delta_t - surf_disp
+    len_slip = wp.length(slip)
+
+    if len_slip < float(1.0e-6):
+        return
+
+    if len_slip <= mu_s * correction_n:
+        pos[i] = pos[i] - slip
+    else:
+        scale = wp.min(mu_k * correction_n / len_slip, float(1.0))
+        pos[i] = pos[i] - slip * scale
+
+
+def apply_vf_friction_rotating_cyl(
+    pos:        wp.array,
+    prev_pos:   wp.array,
+    inv_mass:   wp.array,
+    vf,
+    r:          float,
+    mu_s:       float,
+    mu_k:       float,
+    surf_omega_wp: wp.array,
+    orbit_r:    float,
+    sub_dt:     float,
+    device:     str,
+    min_idx:    int = 0,
+):
+    wp.launch(
+        kernel_vf_friction_rotating_cyl, dim=pos.shape[0], device=device,
+        inputs=[pos, prev_pos, inv_mass,
+                vf.active, vf.dist, vf.normal,
+                r, mu_s, mu_k, int(min_idx),
+                surf_omega_wp, orbit_r, sub_dt],
+    )
+
+
 # ── Kernel: Coulomb friction at edge-edge contact ────────────────────────────
 
 @wp.kernel
@@ -742,12 +840,13 @@ def kernel_roll_a_torque_update(
     angle:           wp.array(dtype=float),   # size-1: current departure angle
     omega:           wp.array(dtype=float),   # size-1: current angular velocity
     write_pos0:      int,                      # 1 = write pos[0] (legacy), 0 = O3 (skip)
+    seg_i:           int,                      # departure-segment start index
 ):
     """Single-thread kernel.
 
-    Reads pos[1] (yarn particle adjacent to departure) to estimate the
+    Reads the departure segment pos[seg_i] → pos[seg_i+1] to estimate the
     tangential tension the yarn exerts on Roll A, integrates Roll A's
-    angular velocity (I = 0.5 * M * r²), then writes the new pos[0].
+    angular velocity (I = 0.5 * M * r²), then (legacy) writes the new pos[0].
 
     Force model (PBD-compatible):
         F ≈ particle_mass * stretch_stiff * stretch / sub_dt²
@@ -758,10 +857,18 @@ def kernel_roll_a_torque_update(
 
     bearing_damping multiplies omega each substep, acting as axle friction.
     """
-    ang     = angle[0]
-    tangent = wp.vec3(-wp.sin(ang), wp.cos(ang), float(0.0))
+    ang = angle[0]
+    # Surface tangent (CCW about +Z) at the departure particle, derived from
+    # its actual radial position so seg_i need not sit at angle[0].  Falls
+    # back to the angle-based tangent when the particle is on the axis.
+    rad   = pos[seg_i] - center
+    r_xy  = wp.sqrt(rad[0] * rad[0] + rad[1] * rad[1])
+    if r_xy > float(1.0e-6):
+        tangent = wp.vec3(-rad[1] / r_xy, rad[0] / r_xy, float(0.0))
+    else:
+        tangent = wp.vec3(-wp.sin(ang), wp.cos(ang), float(0.0))
 
-    seg     = pos[1] - pos[0]
+    seg     = pos[seg_i + 1] - pos[seg_i]
     seg_len = wp.length(seg)
 
     new_omega = omega[0]
@@ -806,13 +913,14 @@ def roll_a_torque_step(
     omega_wp:        wp.array,
     device:          str,
     write_pos0:      int = 1,
+    seg_i:           int = 0,
 ):
     wp.launch(
         kernel_roll_a_torque_update, dim=1, device=device,
         inputs=[pos, center, ra, orbit_r, rest_len, stretch_stiff,
                 particle_mass, roll_mass, sub_dt,
                 bearing_damping, torque_scale, omega_max,
-                angle_wp, omega_wp, int(write_pos0)],
+                angle_wp, omega_wp, int(write_pos0), int(seg_i)],
     )
 
 
