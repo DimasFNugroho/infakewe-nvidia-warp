@@ -41,8 +41,6 @@
   "roll_a_radius": 0.15,
   "roll_a_wraps": 3.0,
   "roll_a_pitch_d": 3.7863157894736843,
-  "roll_a_mu_s": 0.10907127429805616,
-  "roll_a_mu_k": 0.011879049676025918,
   "roll_a_mass": 0.5219330453563715,
   "roll_a_bearing_damping": 0.9978401727861771,
   "roll_a_torque_scale": 1.0,
@@ -72,8 +70,6 @@
   "package_wraps": 20.0,
   "package_pitch_d": 4.0,
   "package_speed": 0.0,
-  "package_mu_s": 0.10907127429805616,
-  "package_mu_k": 0.011879049676025918,
   "package_visible": 1,
   "cyl_x": 0.0,
   "cyl_y": 1.1684210526315795,
@@ -84,12 +80,10 @@
   "cyl_detect_r": 0.2,
   "cyl_detect_show": 0,
   "heatmap_mode": 1,
+  "roll_a_grip": 1.0,
+  "package_grip": 1.0,
   "_ranges": {
     "mu_kinetic": [
-      0.0,
-      1.0
-    ],
-    "roll_a_mu_k": [
       0.0,
       1.0
     ],
@@ -136,10 +130,6 @@
     "package_speed": [
       -5.0,
       5.0
-    ],
-    "package_mu_k": [
-      0.0,
-      1.0
     ],
     "cyl_x": [
       -3.0,

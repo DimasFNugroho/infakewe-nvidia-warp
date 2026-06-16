@@ -174,15 +174,23 @@ def kernel_vf_friction(
         pos[i] = pos[i] - delta_t * scale                                # kinetic
 
 
-# ── Kernel: Coulomb friction against a rotating cylinder surface ─────────────
-# Same cone rule as kernel_vf_friction but the reference frame is the moving
-# surface.  Slip = particle tangential displacement − surface displacement.
-# Sticking means the particle moves WITH the rotating surface, which is exactly
-# the Capstan drag that drives wound yarn off a rotating spool.
+# ── Kernel: driven-roll surface transport (godet / feed roll) ────────────────
+# A driven feed roll CARRIES the wrapped yarn along with its surface, feeding it
+# downstream — it does not pin the yarn to a material point.  So instead of a
+# Coulomb slip rule (which, with a tiny position-based normal proxy, barely
+# drives the yarn and lets a pulling roll stretch it unboundedly), this kernel
+# drives each contacting particle's AZIMUTHAL displacement toward the surface
+# displacement.  The radial (peel-off) and axial (helix-pitch) components are
+# left untouched, so the yarn still lifts cleanly off at the departure tangent.
+#
+#   grip = 1  → perfect no-slip carry (yarn azimuthal speed = surface speed)
+#   grip = 0  → free (no drive)
+# When surf_omega = 0 the target is zero, so a stopped roll holds the wrapped
+# yarn azimuthally in place (tension is held, not fed) — the desired behaviour.
 #
 # surf_omega is a size-1 wp.array (not a Python scalar) so a value updated on
-# the GPU each substep — e.g. omega_a from roll_a_torque_step — drives the
-# surface inside a captured CUDA graph.
+# the GPU each substep — e.g. omega_a from roll_a_servo_step / torque_step —
+# drives the surface inside a captured CUDA graph.
 
 @wp.kernel
 def kernel_vf_friction_rotating_cyl(
@@ -193,21 +201,20 @@ def kernel_vf_friction_rotating_cyl(
     vf_dist:    wp.array(dtype=float),
     vf_normal:  wp.array(dtype=wp.vec3),
     r:          float,
-    mu_s:       float,
-    mu_k:       float,
+    grip:       float,                    # 0..1 surface-carry strength (no-slip = 1)
     min_idx:    int,
-    surf_omega: wp.array(dtype=float),   # size-1: angular velocity (rad/s), +CCW about +Z
+    surf_omega: wp.array(dtype=float),    # size-1: angular velocity (rad/s), +CCW about +Z
     orbit_r:    float,                    # contact-surface radius = cyl_r + ogc_r
     sub_dt:     float,
 ):
-    """Coulomb friction against a cylinder rotating about its axis (+Z).
+    """Transport contacting yarn at the rotating surface's azimuthal speed.
 
-    For each contacting particle the surface tangent at the contact normal n is
-        t_surf = normalize(Z × n) = (-n.y, n.x, 0)
-    The surface displacement per substep is
-        s = surf_omega[0] * orbit_r * sub_dt * t_surf
-    Slip is the particle tangential displacement minus s.  Within the static
-    cone the particle sticks (moves with the surface); outside, kinetic scaling.
+    Surface tangent (azimuthal, feed direction) at contact normal n:
+        t_hat = normalize(Z × n) = normalize(-n.y, n.x, 0)
+    Particle azimuthal displacement this substep:  v_azi = delta_t · t_hat
+    Surface azimuthal displacement:                target = surf_omega·orbit_r·sub_dt
+    Drive only the azimuthal component toward the surface:
+        pos += grip · (target − v_azi) · t_hat
     """
     i = wp.tid()
     if i < min_idx:
@@ -219,34 +226,20 @@ def kernel_vf_friction_rotating_cyl(
     if vf_dist[i] >= r:
         return
 
-    penetration  = r - vf_dist[i]
-    correction_n = wp.max(penetration, r * float(0.5))
-
-    n       = vf_normal[i]
-    delta   = pos[i] - prev_pos[i]
-    delta_t = delta - n * wp.dot(delta, n)
-
-    # Surface tangent for a cylinder with Z axis: t = Z × n = (-ny, nx, 0).
-    # Already unit-length when n is a horizontal unit vector; guard degenerate.
+    n  = vf_normal[i]
     tx = -n[1];  ty = n[0]
     t_len = wp.sqrt(tx * tx + ty * ty)
-    if t_len > float(1.0e-6):
-        s_mag = surf_omega[0] * orbit_r * sub_dt / t_len
-        surf_disp = wp.vec3(tx * s_mag, ty * s_mag, float(0.0))
-    else:
-        surf_disp = wp.vec3(float(0.0), float(0.0), float(0.0))
-
-    slip     = delta_t - surf_disp
-    len_slip = wp.length(slip)
-
-    if len_slip < float(1.0e-6):
+    if t_len < float(1.0e-6):     # contact on a cap; no azimuthal tangent
         return
+    inv_t = float(1.0) / t_len
+    thx = tx * inv_t;  thy = ty * inv_t
 
-    if len_slip <= mu_s * correction_n:
-        pos[i] = pos[i] - slip
-    else:
-        scale = wp.min(mu_k * correction_n / len_slip, float(1.0))
-        pos[i] = pos[i] - slip * scale
+    delta   = pos[i] - prev_pos[i]
+    delta_t = delta - n * wp.dot(delta, n)
+    v_azi   = delta_t[0] * thx + delta_t[1] * thy
+    target  = surf_omega[0] * orbit_r * sub_dt
+    corr    = grip * (target - v_azi)
+    pos[i]  = pos[i] + wp.vec3(thx * corr, thy * corr, float(0.0))
 
 
 def apply_vf_friction_rotating_cyl(
@@ -255,8 +248,7 @@ def apply_vf_friction_rotating_cyl(
     inv_mass:   wp.array,
     vf,
     r:          float,
-    mu_s:       float,
-    mu_k:       float,
+    grip:       float,
     surf_omega_wp: wp.array,
     orbit_r:    float,
     sub_dt:     float,
@@ -267,7 +259,7 @@ def apply_vf_friction_rotating_cyl(
         kernel_vf_friction_rotating_cyl, dim=pos.shape[0], device=device,
         inputs=[pos, prev_pos, inv_mass,
                 vf.active, vf.dist, vf.normal,
-                r, mu_s, mu_k, int(min_idx),
+                r, float(grip), int(min_idx),
                 surf_omega_wp, orbit_r, sub_dt],
     )
 

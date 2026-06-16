@@ -77,16 +77,17 @@ DEFAULTS = {
     "self_ee_stiff":     0.2938856015779093,  # stiffness for yarn self-collision projection
     "mu_static":         0.10907127429805616,  # yarn↔yarn self-collision
     "mu_kinetic":        0.011879049676025918,
-    # Per-surface friction: the yarn↔surface material pairing differs on each
-    # cylinder, so package, Roll A, guide and Roll B each have their own μ pair.
-    "roll_a_mu_s":       0.10907127429805616,
-    "roll_a_mu_k":       0.011879049676025918,
+    # Passive Coulomb surfaces (yarn slides over them): Roll B and the guide
+    # each have their own static/kinetic μ pair.
     "roll_b_mu_s":       0.10907127429805616,
     "roll_b_mu_k":       0.011879049676025918,
-    "package_mu_s":      0.10907127429805616,
-    "package_mu_k":      0.011879049676025918,
     "guide_mu_s":        0.10907127429805616,
     "guide_mu_k":        0.011879049676025918,
+    # Driven feed rolls (Roll A, package) CARRY the wrapped yarn at their
+    # surface speed — characterised by a "grip" (surface-carry strength) in
+    # [0, 1] instead of a Coulomb μ pair.  1 = perfect no-slip feed roll.
+    "roll_a_grip":       1.0,
+    "package_grip":      1.0,
     "v_max":             20.0,
     # Roll A — feeding roll
     "roll_a_x":         -0.8,
@@ -106,6 +107,15 @@ DEFAULTS = {
     "roll_a_servo_source":     1,     # 0 = Sensor A (free-span midpoint), 1 = anchor segments (collocated)
     "roll_a_anchor_k":         3,     # number of segments averaged for anchor tension (1..20)
     "roll_a_tension_ewma":     0.20,  # EWMA smoothing α ∈ [0, 1]; 1 = no smoothing
+    # Roll A — tension-window feeder (matches the real experimental feeder:
+    # starts/stops on a tension window, ramps slow→fast in between; the drum
+    # surface speed is prescribed, like the package, and friction feeds yarn)
+    "roll_a_window_on":   0,     # 1 = window feeder (overrides PI servo + flywheel)
+    "roll_a_t_start":     6.0,   # cN — start feeding when T rises above this
+    "roll_a_t_stop":      3.0,   # cN — stop feeding when T falls below this
+    "roll_a_t_fast":     12.0,   # cN — tension at which speed reaches v_fast
+    "roll_a_v_slow":      0.5,   # m/s — surface speed at the start threshold
+    "roll_a_v_fast":      5.0,   # m/s — surface speed at/above t_fast
     # Roll B — pulling roll
     "roll_b_x":          0.8,
     "roll_b_y":         -0.36363636363636376,
@@ -268,6 +278,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
     _servo_omega_cmd = [0.0]   # last computed servo omega command (rad/s, for HUD)
     _servo_t_prev    = [None]  # perf_counter() at previous PI tick
     _T_anchor_filt   = [0.0]   # EWMA-filtered anchor-segment tension (cN)
+    _feeder_on       = [False] # tension-window feeder hysteresis state
+    _feeder_v        = [0.0]   # last commanded feeder surface speed (m/s, HUD)
 
     # ── Geometry helpers ──────────────────────────────────────────────────────
 
@@ -817,6 +829,19 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
 
     apply_state()
 
+    def _feed_wrap_dir() -> float:
+        """+1 / −1: helix wrap sense shared by the package and the drum.
+
+        Determined by the P→A→C centre geometry (same cross product as
+        _warp_keypoints).  Rotating a cylinder at +wrap_dir advances its
+        wound yarn toward the departure tangent, i.e. feeds it downstream.
+        """
+        ax, ay = float(state["roll_a_x"]),  float(state["roll_a_y"])
+        cx, cy = float(state["cyl_x"]),     float(state["cyl_y"])
+        px, py = float(state["package_x"]), float(state["package_y"])
+        cross_z_a = (px - ax) * (cy - ay) - (py - ay) * (cx - ax)
+        return +1.0 if cross_z_a < 0.0 else -1.0
+
     def _set_pkg_omega():
         """package_speed (m/s at the spool surface) → signed omega_p (rad/s).
 
@@ -824,13 +849,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         package_speed advances the wound yarn toward its departure tangent,
         i.e. unwinds it toward Roll A.
         """
-        ax, ay = float(state["roll_a_x"]),  float(state["roll_a_y"])
-        cx, cy = float(state["cyl_x"]),     float(state["cyl_y"])
-        px, py = float(state["package_x"]), float(state["package_y"])
-        cross_z_a  = (px - ax) * (cy - ay) - (py - ay) * (cx - ax)
-        wrap_dir_p = +1.0 if cross_z_a < 0.0 else -1.0
         rp    = max(float(state["package_radius"]), 1e-6)
-        omega = wrap_dir_p * float(state.get("package_speed", 0.0)) / rp
+        omega = _feed_wrap_dir() * float(state.get("package_speed", 0.0)) / rp
         omega_p_host[0] = omega
         omega_p_wp.assign(wp.array([omega], dtype=float, device=device))
 
@@ -849,6 +869,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         _servo_integral[0] = 0.0
         _servo_omega_cmd[0] = 0.0
         _T_anchor_filt[0]  = 0.0
+        _feeder_on[0]      = False
+        _feeder_v[0]       = 0.0
         pos0, n_wound, drum_base, n_wd = make_initial_positions()
         # make_initial_positions() sets angle_a[0]/angle_b[0] to exact tangent angles — re-sync GPU.
         angle_a_wp.assign(wp.array([angle_a[0]], dtype=float, device=device))
@@ -881,14 +903,12 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             "self_ee_stiff":          float(state.get("self_ee_stiff", 0.3)),
             "mu_static":              float(state["mu_static"]),
             "mu_kinetic":             float(state["mu_kinetic"]),
-            "roll_a_mu_s":            float(state.get("roll_a_mu_s",  0.0)),
-            "roll_a_mu_k":            float(state.get("roll_a_mu_k",  0.0)),
             "roll_b_mu_s":            float(state.get("roll_b_mu_s",  0.0)),
             "roll_b_mu_k":            float(state.get("roll_b_mu_k",  0.0)),
-            "package_mu_s":           float(state.get("package_mu_s", 0.0)),
-            "package_mu_k":           float(state.get("package_mu_k", 0.0)),
             "guide_mu_s":             float(state.get("guide_mu_s",   0.0)),
             "guide_mu_k":             float(state.get("guide_mu_k",   0.0)),
+            "roll_a_grip":            float(state.get("roll_a_grip",  1.0)),
+            "package_grip":           float(state.get("package_grip", 1.0)),
             "v_max":                  float(state["v_max"]),
             "pull_speed":             float(state["pull_speed"]),
             "particle_mass":          float(state["particle_mass"]),
@@ -905,6 +925,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             "roll_b_radius":          float(state["roll_b_radius"]),
             "self_collision":         int(state.get("self_collision", 1)),
             "roll_a_servo_on":        int(state.get("roll_a_servo_on", 0)),
+            "roll_a_window_on":       int(state.get("roll_a_window_on", 0)),
             "roll_b_torque_limit_on": int(state.get("roll_b_torque_limit_on", 0)),
             "roll_b_max_torque":      float(state.get("roll_b_max_torque", 5.0)),
             "roll_b_mass":            float(state.get("roll_b_mass", 0.5)),
@@ -1215,14 +1236,13 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         self_ee_stiff = float(state.get("self_ee_stiff", 0.3))
         mu_s          = float(state["mu_static"])    # yarn ↔ yarn
         mu_k          = float(state["mu_kinetic"])
-        mu_s_a        = float(state.get("roll_a_mu_s",  mu_s))   # yarn ↔ drum
-        mu_k_a        = float(state.get("roll_a_mu_k",  mu_k))
-        mu_s_b        = float(state.get("roll_b_mu_s",  mu_s))   # yarn ↔ Roll B
+        mu_s_b        = float(state.get("roll_b_mu_s",  mu_s))   # yarn ↔ Roll B (Coulomb)
         mu_k_b        = float(state.get("roll_b_mu_k",  mu_k))
-        mu_s_p        = float(state.get("package_mu_s", mu_s))   # yarn ↔ package
-        mu_k_p        = float(state.get("package_mu_k", mu_k))
-        mu_s_g        = float(state.get("guide_mu_s",   mu_s))   # yarn ↔ guide
+        mu_s_g        = float(state.get("guide_mu_s",   mu_s))   # yarn ↔ guide  (Coulomb)
         mu_k_g        = float(state.get("guide_mu_k",   mu_k))
+        # Driven feed rolls: surface-carry grip in [0, 1] (1 = no-slip).
+        grip_a        = float(np.clip(state.get("roll_a_grip",  1.0), 0.0, 1.0))
+        grip_p        = float(np.clip(state.get("package_grip", 1.0), 0.0, 1.0))
         v_max         = float(state["v_max"])
         self_coll_on  = bool(int(state.get("self_collision", 1)))
         zero_wind     = wp.vec3(0.0, 0.0, 0.0)
@@ -1238,6 +1258,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         orbit_r_a  = ra + r
         orbit_r_b  = rb + r
         servo_on   = bool(int(state.get("roll_a_servo_on", 0)))
+        window_on  = bool(int(state.get("roll_a_window_on", 0)))
+        # Both servo and window feeder prescribe omega_a through omega_cmd_wp;
+        # only the host-side control law that fills omega_cmd_wp differs.
+        prescribed_a = servo_on or window_on
         torque_limited_b = bool(int(state.get("roll_b_torque_limit_on", 0)))
         target_omega_b   = float(state["pull_speed"]) / rb
         M_b              = max(float(state["roll_b_mass"]), 1e-3)
@@ -1254,7 +1278,7 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         orbit_r_p = max(float(state["package_radius"]), 1e-6) + r
 
         for _ in range(config.SUBSTEPS):
-            if servo_on:
+            if prescribed_a:
                 roll_a_servo_step(
                     pos_wp, center_a, orbit_r_a, sub_dt, 200.0,
                     angle_a_wp, omega_a_wp, omega_cmd_wp, device,
@@ -1317,40 +1341,36 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                 if self_coll_on:
                     project_self_ee(pos_wp, inv_mass_wp, yarn_edges_wp,
                                     self_ee, r, self_ee_stiff, device)
-            # Roll A (contacts[0]): rotating-surface friction — wound particles
-            # are free and the drum's angular velocity (omega_a, updated on the
-            # GPU each substep) sets the friction reference frame, so a turning
-            # drum drags the wrapped yarn with it (Capstan drive).
+            # Roll A (contacts[0]): driven feed roll — the surface CARRIES the
+            # wrapped yarn at the drum's surface speed (omega_a, GPU-updated each
+            # substep), feeding it downstream.  No static edge friction here: it
+            # would pin the yarn to the surface and fight the feed.
             obs_a_entry, vf_a_cur, ee_a_cur = contacts[0]
             apply_vf_friction_rotating_cyl(
                 pos_wp, prev_pos_wp, inv_mass_wp,
-                vf_a_cur, r, mu_s_a, mu_k_a,
+                vf_a_cur, r, grip_a,
                 omega_a_wp, orbit_r_a, sub_dt, device,
             )
-            apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
-                              yarn_edges_wp, ee_a_cur, r, mu_s_a, mu_k_a, device)
-            # Roll B (contacts[1]): static-surface friction, Roll-B-specific μ.
+            # Roll B (contacts[1]): passive Coulomb surface, Roll-B-specific μ.
             _, vf_b_cur, ee_b_cur = contacts[1]
             apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                               vf_b_cur, r, mu_s_b, mu_k_b, device)
             apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                               yarn_edges_wp, ee_b_cur, r, mu_s_b, mu_k_b, device)
-            # Guide (contacts[2]): static-surface friction, guide-specific μ.
+            # Guide (contacts[2]): passive Coulomb surface, guide-specific μ.
             _, vf_g_cur, ee_g_cur = contacts[2]
             apply_vf_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                               vf_g_cur, r, mu_s_g, mu_k_g, device)
             apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                               yarn_edges_wp, ee_g_cur, r, mu_s_g, mu_k_g, device)
-            # Package (contacts[3]): driven spool — rotating-surface friction
-            # at omega_p drags the wound yarn off (or onto) the package.
+            # Package (contacts[3]): driven spool — same surface-carry feed as
+            # Roll A, at the package's prescribed omega_p.
             _, vf_pkg_cur, ee_pkg_cur = contacts[3]
             apply_vf_friction_rotating_cyl(
                 pos_wp, prev_pos_wp, inv_mass_wp,
-                vf_pkg_cur, r, mu_s_p, mu_k_p,
+                vf_pkg_cur, r, grip_p,
                 omega_p_wp, orbit_r_p, sub_dt, device,
             )
-            apply_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
-                              yarn_edges_wp, ee_pkg_cur, r, mu_s_p, mu_k_p, device)
             if self_coll_on:
                 apply_self_ee_friction(pos_wp, prev_pos_wp, inv_mass_wp,
                                        yarn_edges_wp, self_ee, r, mu_s, mu_k, device)
@@ -1491,6 +1511,25 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         pkg_spoke.visible = pkg_vis.visible
 
     _update_pkg_spoke()
+
+    # Same spin marker for Roll A, driven by the drum's actual GPU-integrated
+    # angle (angle_a_wp) so it reflects flywheel, servo and window-feeder
+    # rotation alike.
+    roll_a_pin = visuals.Line(pos=np.zeros((2, 3), dtype=np.float32),
+                              color=(1.0, 1.0, 1.0, 0.9), width=5,
+                              connect="segments", parent=view.scene)
+
+    def _update_roll_a_pin(theta: float):
+        ax_, ay_, az_ = (float(state["roll_a_x"]), float(state["roll_a_y"]),
+                         float(state["roll_a_z"]))
+        ra_ = float(state["roll_a_radius"])
+        c, s = np.cos(theta), np.sin(theta)
+        pts = np.array([[ax_ + 0.95 * ra_ * c, ay_ + 0.95 * ra_ * s, az_],
+                        [ax_ + 1.30 * ra_ * c, ay_ + 1.30 * ra_ * s, az_]],
+                       dtype=np.float32)
+        roll_a_pin.set_data(pos=pts)
+
+    _update_roll_a_pin(angle_a[0])
     scA_vis     = visuals.Mesh(vertices=vsA, faces=fsA, color=SCY_A_COL,   shading="smooth", parent=view.scene)
     scB_vis     = visuals.Mesh(vertices=vsB, faces=fsB, color=SCY_B_COL,   shading="smooth", parent=view.scene)
     scA_vis.visible  = bool(int(state.get("sensor_a_cyl_enabled", 0)))
@@ -2223,10 +2262,44 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         alpha = float(np.clip(state.get("roll_a_tension_ewma", 0.20), 0.0, 1.0))
         _T_anchor_filt[0] = alpha * T_anchor_raw + (1.0 - alpha) * _T_anchor_filt[0]
 
-        # ── Roll A tension servo (PI on T_a) ─────────────────────────────────
+        # ── Roll A control: tension-window feeder, or PI servo ───────────────
         servo_on  = bool(int(state.get("roll_a_servo_on", 0)))
+        window_on = bool(int(state.get("roll_a_window_on", 0)))
         servo_src = int(state.get("roll_a_servo_source", 1))   # 0=sensor, 1=anchor
-        if servo_on and running[0]:
+        if window_on and running[0]:
+            # Tension-window feeder (mirrors the real experimental feeder):
+            #   OFF → ON  when T rises above t_start
+            #   ON  → OFF when T falls below t_stop   (t_stop < t_start: hysteresis)
+            # While ON, surface speed ramps linearly from v_slow (at t_start)
+            # to v_fast (at t_fast); the drum spins like the driven package and
+            # rotating-surface friction feeds the wound yarn downstream.
+            T_proc  = _T_anchor_filt[0] if servo_src == 1 else float(shared[0])
+            t_start = float(state.get("roll_a_t_start", 6.0))
+            t_stop  = min(float(state.get("roll_a_t_stop", 3.0)), t_start)
+            t_fast  = max(float(state.get("roll_a_t_fast", 12.0)), t_start + 1e-6)
+            v_slow  = float(state.get("roll_a_v_slow", 0.5))
+            v_fast  = float(state.get("roll_a_v_fast", 5.0))
+
+            if not _feeder_on[0] and T_proc > t_start:
+                _feeder_on[0] = True
+            elif _feeder_on[0] and T_proc < t_stop:
+                _feeder_on[0] = False
+
+            if _feeder_on[0]:
+                u     = float(np.clip((T_proc - t_start) / (t_fast - t_start), 0.0, 1.0))
+                v_cmd = v_slow + (v_fast - v_slow) * u
+            else:
+                v_cmd = 0.0
+            _feeder_v[0] = v_cmd
+
+            ra_       = max(float(state["roll_a_radius"]), 1e-6)
+            omega_cmd = float(np.clip(_feed_wrap_dir() * v_cmd / ra_, -200.0, 200.0))
+            _servo_omega_cmd[0] = omega_cmd
+            omega_cmd_wp.assign(wp.array([omega_cmd], dtype=float, device=device))
+            # Keep the PI state clean for a later mode switch.
+            _servo_t_prev[0]   = None
+            _servo_integral[0] = 0.0
+        elif servo_on and running[0]:
             now = time.perf_counter()
             dt_ctrl = (now - _servo_t_prev[0]) if _servo_t_prev[0] is not None else (1.0 / 60.0)
             _servo_t_prev[0] = now
@@ -2256,11 +2329,14 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             # Reset integral while servo is off so re-engagement starts clean.
             _servo_integral[0] = 0.0
             _servo_omega_cmd[0] = 0.0
+            _feeder_on[0]       = False
+            _feeder_v[0]        = 0.0
 
         # Read Roll A/B state from GPU once per frame (not per substep).
         _omega_a = float(omega_a_wp.numpy()[0])
         _angle_a = float(angle_a_wp.numpy()[0])
         _omega_b = float(omega_b_wp.numpy()[0])
+        _update_roll_a_pin(_angle_a)
 
         status     = "RUN" if running[0] else "PAUSED"
         graph_mode = "graph" if (_USE_GRAPH and _graph[0] is not None
@@ -2287,7 +2363,15 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             f"T_anchor={_T_anchor_filt[0]:.2f}cN (raw={T_anchor_raw:.2f})  "
             f"src={src_label}  k={anchor_k}  α={alpha:.2f}\n"
         )
-        if servo_on:
+        if window_on:
+            T_pv = _T_anchor_filt[0] if servo_src == 1 else float(_T_a)
+            servo_line = (
+                f"FEEDER: {'ON ' if _feeder_on[0] else 'OFF'}  T={T_pv:.2f}cN  "
+                f"window=[{float(state.get('roll_a_t_stop', 0)):.1f}↓ "
+                f"{float(state.get('roll_a_t_start', 0)):.1f}↑]cN  "
+                f"v={_feeder_v[0]:.2f} m/s  ωcmd={_servo_omega_cmd[0]:+.1f} rad/s\n"
+            )
+        elif servo_on:
             T_pv = _T_anchor_filt[0] if servo_src == 1 else float(_T_a)
             servo_line = (
                 f"SERVO: ON  setpt={float(state.get('roll_a_tension_setpoint', 0)):.2f}cN  "
@@ -2554,16 +2638,15 @@ def run_ui(cmd_queue, shared, dbg_shared):
     add_slider("Roll A  wraps",   "roll_a_wraps",   0.5, 20.0,  DEFAULTS["roll_a_wraps"], fmt="{:.2f}")
     add_slider("Roll A  helix pitch (×2r)", "roll_a_pitch_d", 0.5, 4.0,
                DEFAULTS["roll_a_pitch_d"], fmt="{:.2f}")
-    add_slider("Roll A  μ_static",  "roll_a_mu_s", 0.0, 1.0, DEFAULTS["roll_a_mu_s"])
-    add_slider("Roll A  μ_kinetic", "roll_a_mu_k", 0.0, 1.0, DEFAULTS["roll_a_mu_k"],
-               editable_range=True)
+    add_slider("Roll A  surface grip (1=no-slip)", "roll_a_grip", 0.0, 1.0,
+               DEFAULTS["roll_a_grip"], fmt="{:.2f}")
     add_slider("Roll A  mass (kg)", "roll_a_mass",  0.01, 5.0,  DEFAULTS["roll_a_mass"])
     add_slider("Roll A  bearing damp", "roll_a_bearing_damping", 0.0, 1.0,
                DEFAULTS["roll_a_bearing_damping"])
     add_slider("Roll A  torque scale", "roll_a_torque_scale",    0.0, 1.0,
                DEFAULTS["roll_a_torque_scale"])
 
-    section("Roll A servo — measurement source")
+    section("Roll A control — tension measurement source")
     _src_var = tk.IntVar(value=DEFAULTS["roll_a_servo_source"])
     _src_frm = ttk.Frame(scroll_frm)
     _src_frm.pack(fill="x", padx=8, pady=3)
@@ -2602,6 +2685,30 @@ def run_ui(cmd_queue, shared, dbg_shared):
                DEFAULTS["roll_a_kp"], fmt="{:+.3f}", editable_range=True)
     add_slider("Servo ki (rad/s per cN·s)", "roll_a_ki", -20.0, 20.0,
                DEFAULTS["roll_a_ki"], fmt="{:+.3f}", editable_range=True)
+
+    section("Roll A — tension-window feeder (start/stop + ramp)")
+    _win_on_var = tk.IntVar(value=DEFAULTS["roll_a_window_on"])
+    _win_on_frm = ttk.Frame(scroll_frm)
+    _win_on_frm.pack(fill="x", padx=8, pady=3)
+    def _on_window_toggle():
+        cmd_queue.put(("param", "roll_a_window_on", _win_on_var.get()))
+    ttk.Checkbutton(_win_on_frm,
+                    text="Enable window feeder (overrides servo + flywheel)",
+                    variable=_win_on_var, command=_on_window_toggle).pack(side="left")
+    param_vars["roll_a_window_on"]      = _win_on_var
+    param_callbacks["roll_a_window_on"] = lambda v: (
+        _win_on_var.set(int(v)), cmd_queue.put(("param", "roll_a_window_on", int(v)))
+    )
+    add_slider("Start tension (cN)",        "roll_a_t_start", 0.0, 50.0,
+               DEFAULTS["roll_a_t_start"], fmt="{:.2f}", editable_range=True)
+    add_slider("Stop tension (cN)",         "roll_a_t_stop",  0.0, 50.0,
+               DEFAULTS["roll_a_t_stop"],  fmt="{:.2f}", editable_range=True)
+    add_slider("Full-speed tension (cN)",   "roll_a_t_fast",  0.0, 50.0,
+               DEFAULTS["roll_a_t_fast"],  fmt="{:.2f}", editable_range=True)
+    add_slider("Slow surface speed (m/s)",  "roll_a_v_slow",  0.0, 10.0,
+               DEFAULTS["roll_a_v_slow"],  fmt="{:.2f}", editable_range=True)
+    add_slider("Fast surface speed (m/s)",  "roll_a_v_fast",  0.0, 10.0,
+               DEFAULTS["roll_a_v_fast"],  fmt="{:.2f}", editable_range=True)
 
     section("Roll B — pulling roll")
     add_slider("Roll B  X",      "roll_b_x",      -3.0,  3.0, DEFAULTS["roll_b_x"],      fmt="{:+.3f}")
@@ -2645,9 +2752,8 @@ def run_ui(cmd_queue, shared, dbg_shared):
                DEFAULTS["package_pitch_d"], fmt="{:.2f}")
     add_slider("Package  surface speed (m/s)", "package_speed", -5.0, 5.0,
                DEFAULTS["package_speed"], fmt="{:+.2f}", editable_range=True)
-    add_slider("Package  μ_static",  "package_mu_s", 0.0, 1.0, DEFAULTS["package_mu_s"])
-    add_slider("Package  μ_kinetic", "package_mu_k", 0.0, 1.0, DEFAULTS["package_mu_k"],
-               editable_range=True)
+    add_slider("Package  surface grip (1=no-slip)", "package_grip", 0.0, 1.0,
+               DEFAULTS["package_grip"], fmt="{:.2f}")
     _pkg_vis_var = tk.IntVar(value=DEFAULTS["package_visible"])
     _pkg_vis_frm = ttk.Frame(scroll_frm)
     _pkg_vis_frm.pack(fill="x", padx=8, pady=3)
