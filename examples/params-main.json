@@ -55,14 +55,7 @@
   "roll_b_y": -0.34736842105263177,
   "roll_b_z": 0.1957894736842105,
   "roll_b_radius": 0.15,
-  "roll_b_mu_s": 0.10907127429805616,
-  "roll_b_mu_k": 0.011879049676025918,
-  "pull_speed": -5.0,
-  "roll_b_torque_limit_on": 1,
-  "roll_b_max_torque": 5.0,
-  "roll_b_mass": 0.5,
-  "roll_b_bearing_damping": 0.998,
-  "roll_b_drive_gain": 50.0,
+  "pull_speed": 5.0,
   "package_x": -0.7263157894736842,
   "package_y": -0.9284210526315793,
   "package_z": -0.4357894736842107,
@@ -82,6 +75,9 @@
   "heatmap_mode": 1,
   "roll_a_grip": 1.0,
   "package_grip": 1.0,
+  "roll_b_grip": 1.0,
+  "roll_b_wraps": 3.0,
+  "roll_b_pitch_d": 1.0,
   "_ranges": {
     "mu_kinetic": [
       0.0,
@@ -99,21 +95,9 @@
       -20.0,
       20.0
     ],
-    "roll_b_mu_k": [
-      0.0,
-      1.0
-    ],
     "pull_speed": [
       -5.0,
       5.0
-    ],
-    "roll_b_max_torque": [
-      0.01,
-      100.0
-    ],
-    "roll_b_drive_gain": [
-      1.0,
-      500.0
     ],
     "package_x": [
       -3.0,
