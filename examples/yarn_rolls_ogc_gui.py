@@ -108,12 +108,13 @@ DEFAULTS = {
     "roll_a_anchor_k":         3,     # number of segments averaged for anchor tension (1..20)
     "roll_a_tension_ewma":     0.20,  # EWMA smoothing α ∈ [0, 1]; 1 = no smoothing
     # Roll A — tension-window feeder (matches the real experimental feeder:
-    # starts/stops on a tension window, ramps slow→fast in between; the drum
-    # surface speed is prescribed, like the package, and friction feeds yarn)
+    # rotates only while tension is inside the band [t_start, t_stop]; below
+    # t_start there's no demand, above t_stop it cuts out. Ramps slow→fast in
+    # between; the drum surface speed is prescribed and friction feeds the yarn)
     "roll_a_window_on":   0,     # 1 = window feeder (overrides PI servo + flywheel)
-    "roll_a_t_start":     6.0,   # cN — start feeding when T rises above this
-    "roll_a_t_stop":      3.0,   # cN — stop feeding when T falls below this
-    "roll_a_t_fast":     12.0,   # cN — tension at which speed reaches v_fast
+    "roll_a_t_start":     6.0,   # cN — start rotating when T rises above this (lower edge)
+    "roll_a_t_stop":     18.0,   # cN — stop rotating when T exceeds this (upper edge); > t_start
+    "roll_a_t_fast":     12.0,   # cN — tension at which speed reaches v_fast (between the edges)
     "roll_a_v_slow":      0.5,   # m/s — surface speed at the start threshold
     "roll_a_v_fast":      5.0,   # m/s — surface speed at/above t_fast
     # Roll B — pulling roll
@@ -175,7 +176,8 @@ DEFAULTS = {
 
 # ── Simulation worker process ─────────────────────────────────────────────────
 
-def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
+def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict,
+               ui_queue=None):
     """Run Warp + OGC (3 obstacles) + vispy in a dedicated process."""
     sys.path.insert(0, os.path.join(script_dir, ".."))
     sys.path.insert(0, script_dir)
@@ -419,6 +421,18 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             orbit_r_c=orbit_r_c, orbit_r_b=orbit_r_b,
         )
 
+    def _emit_ui(*keys):
+        """Push sim-changed param values back to the UI so its sliders (and the
+        Save-params snapshot) stay in sync with state the sim mutates itself —
+        3D-view drags and sensor auto-placement.  Keyed by param name."""
+        if ui_queue is None:
+            return
+        for k in keys:
+            try:
+                ui_queue.put(("setvar", k, float(state[k])))
+            except Exception:
+                pass
+
     def _auto_place_sensors():
         """Auto-place sensor A/B centers at span midpoints.
 
@@ -491,6 +505,10 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
                      ("sensor_b_z", mid_b[2])):
             state[k] = float(v)
         _sphere_centers[1] = mid_b.copy()
+
+        # Mirror the auto-placed centres onto the UI sliders.
+        _emit_ui("sensor_a_x", "sensor_a_y", "sensor_a_z",
+                 "sensor_b_x", "sensor_b_y", "sensor_b_z")
 
     def make_initial_positions() -> tuple:
         """O3 layout: package wraps → transit → drum wraps → A→C span → arc → C→B span.
@@ -2121,23 +2139,29 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             state["sensor_a_x"] = x; state["sensor_a_y"] = y; state["sensor_a_z"] = z
             _sphere_centers[0]  = new_pos
             rebuild_scA()
+            _emit_ui("sensor_a_x", "sensor_a_y", "sensor_a_z")
         elif who == "sensor_b":
             state["sensor_b_x"] = x; state["sensor_b_y"] = y; state["sensor_b_z"] = z
             _sphere_centers[1]  = new_pos
             rebuild_scB()
+            _emit_ui("sensor_b_x", "sensor_b_y", "sensor_b_z")
         elif who == "cyl":
             state["cyl_x"]  = x; state["cyl_y"]  = y; state["cyl_z"]  = z
             rebuild_guide()
             rebuild_detect_vol()
+            _emit_ui("cyl_x", "cyl_y", "cyl_z")
         elif who == "roll_a":
             state["roll_a_x"] = x; state["roll_a_y"] = y; state["roll_a_z"] = z
             rebuild_roll_a()
+            _emit_ui("roll_a_x", "roll_a_y", "roll_a_z")
         elif who == "roll_b":
             state["roll_b_x"] = x; state["roll_b_y"] = y; state["roll_b_z"] = z
             rebuild_roll_b()
+            _emit_ui("roll_b_x", "roll_b_y", "roll_b_z")
         elif who == "package":
             state["package_x"] = x; state["package_y"] = y; state["package_z"] = z
             rebuild_package()
+            _emit_ui("package_x", "package_y", "package_z")
 
         _update_sensor_visuals()
         _refresh_gizmos()
@@ -2268,25 +2292,30 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
         servo_src = int(state.get("roll_a_servo_source", 1))   # 0=sensor, 1=anchor
         if window_on and running[0]:
             # Tension-window feeder (mirrors the real experimental feeder):
-            #   OFF → ON  when T rises above t_start
-            #   ON  → OFF when T falls below t_stop   (t_stop < t_start: hysteresis)
-            # While ON, surface speed ramps linearly from v_slow (at t_start)
-            # to v_fast (at t_fast); the drum spins like the driven package and
-            # rotating-surface friction feeds the wound yarn downstream.
+            # Roll A rotates only while tension is INSIDE the band
+            # [t_start, t_stop]:
+            #   T < t_start  → stopped (no demand for yarn yet)
+            #   t_start ≤ T ≤ t_stop → rotating (ramp v_slow→v_fast)
+            #   T > t_stop   → stopped (over-tension cut-out)
+            # A small hysteresis margin on each edge prevents on/off chatter.
             T_proc  = _T_anchor_filt[0] if servo_src == 1 else float(shared[0])
             t_start = float(state.get("roll_a_t_start", 6.0))
-            t_stop  = min(float(state.get("roll_a_t_stop", 3.0)), t_start)
-            t_fast  = max(float(state.get("roll_a_t_fast", 12.0)), t_start + 1e-6)
+            t_stop  = max(float(state.get("roll_a_t_stop", 18.0)), t_start + 1e-6)
+            t_fast  = float(np.clip(state.get("roll_a_t_fast", 12.0), t_start, t_stop))
             v_slow  = float(state.get("roll_a_v_slow", 0.5))
             v_fast  = float(state.get("roll_a_v_fast", 5.0))
+            hyst    = 0.03 * (t_stop - t_start)   # sticky margin (~3% of band)
 
-            if not _feeder_on[0] and T_proc > t_start:
-                _feeder_on[0] = True
-            elif _feeder_on[0] and T_proc < t_stop:
-                _feeder_on[0] = False
+            if not _feeder_on[0]:
+                if t_start <= T_proc <= t_stop:          # entered the band
+                    _feeder_on[0] = True
+            else:
+                if T_proc < t_start - hyst or T_proc > t_stop + hyst:  # left it
+                    _feeder_on[0] = False
 
             if _feeder_on[0]:
-                u     = float(np.clip((T_proc - t_start) / (t_fast - t_start), 0.0, 1.0))
+                u     = float(np.clip((T_proc - t_start) / max(t_fast - t_start, 1e-6),
+                                      0.0, 1.0))
                 v_cmd = v_slow + (v_fast - v_slow) * u
             else:
                 v_cmd = 0.0
@@ -2367,8 +2396,8 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
             T_pv = _T_anchor_filt[0] if servo_src == 1 else float(_T_a)
             servo_line = (
                 f"FEEDER: {'ON ' if _feeder_on[0] else 'OFF'}  T={T_pv:.2f}cN  "
-                f"window=[{float(state.get('roll_a_t_stop', 0)):.1f}↓ "
-                f"{float(state.get('roll_a_t_start', 0)):.1f}↑]cN  "
+                f"band=[{float(state.get('roll_a_t_start', 0)):.1f} … "
+                f"{float(state.get('roll_a_t_stop', 0)):.1f}]cN  "
                 f"v={_feeder_v[0]:.2f} m/s  ωcmd={_servo_omega_cmd[0]:+.1f} rad/s\n"
             )
         elif servo_on:
@@ -2404,10 +2433,15 @@ def sim_worker(cmd_queue, shared, dbg_shared, script_dir: str, defaults: dict):
 
 # ── Tkinter control panel (parent process) ────────────────────────────────────
 
-def run_ui(cmd_queue, shared, dbg_shared):
+def run_ui(cmd_queue, shared, dbg_shared, ui_queue=None):
     import json
+    import queue as py_queue
     import tkinter as tk
     from tkinter import ttk, filedialog
+
+    # When True, a slider value is being set from a sim-originated update
+    # (3D drag / sensor auto-place); on_change must NOT echo it back to the sim.
+    _echo_suppress = [False]
 
     root = tk.Tk()
     root.title("OGC roll-to-roll yarn — controls")
@@ -2468,12 +2502,14 @@ def run_ui(cmd_queue, shared, dbg_shared):
                 iv = int(round(float(v)))
                 val_var.set(iv)
                 disp_var.set(f"{iv} / {int(_range[1])}")
-                cmd_queue.put(("param", key, iv))
+                if not _echo_suppress[0]:
+                    cmd_queue.put(("param", key, iv))
             else:
                 fv = float(v)
                 val_var.set(fv)
                 disp_var.set(fmt.format(fv))
-                cmd_queue.put(("param", key, fv))
+                if not _echo_suppress[0]:
+                    cmd_queue.put(("param", key, fv))
 
         scale = ttk.Scale(frm, from_=_range[0], to=_range[1], variable=val_var,
                           orient="horizontal", command=on_change)
@@ -2817,13 +2853,7 @@ def run_ui(cmd_queue, shared, dbg_shared):
             json.dump(data, f, indent=2)
         print(f"[ui] saved parameters to {path}", flush=True)
 
-    def load_params():
-        path = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Load parameters",
-        )
-        if not path:
-            return
+    def _load_params_from(path):
         with open(path) as f:
             data = json.load(f)
         # Restore custom slider ranges FIRST so subsequent value loads don't
@@ -2850,6 +2880,15 @@ def run_ui(cmd_queue, shared, dbg_shared):
                 param_callbacks[key](default_val)
         _update_n_label()
         print(f"[ui] loaded parameters from {path}", flush=True)
+
+    def load_params():
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Load parameters",
+        )
+        if not path:
+            return
+        _load_params_from(path)
 
     # ── Buttons (pinned to the bottom, outside the scroll area) ──────────────
     def send(cmd: str):
@@ -3352,6 +3391,28 @@ def run_ui(cmd_queue, shared, dbg_shared):
         root.quit()             # exits mainloop(); __main__ finally block cleans up
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+
+    # Reverse channel: apply sim-originated param updates (3D drags, sensor
+    # auto-placement) onto the sliders so they — and the Save snapshot — track
+    # the real state.  Suppressed so applying them doesn't echo back to the sim.
+    def _poll_ui_queue():
+        if ui_queue is not None:
+            try:
+                while True:
+                    msg = ui_queue.get_nowait()
+                    if msg and msg[0] == "setvar":
+                        _, key, val = msg
+                        if key in param_vars and key in param_callbacks:
+                            _echo_suppress[0] = True
+                            try:
+                                param_callbacks[key](val)
+                            finally:
+                                _echo_suppress[0] = False
+            except py_queue.Empty:
+                pass
+        root.after(120, _poll_ui_queue)
+    root.after(120, _poll_ui_queue)
+
     root.mainloop()
     root.destroy()              # safe to destroy now that mainloop has returned
 
@@ -3367,14 +3428,15 @@ if __name__ == "__main__":
     dbg_shared = mp.Array('d', DBG_ARRAY_LEN)
 
     cmd_queue = mp.Queue()
+    ui_queue  = mp.Queue()   # reverse channel: sim → UI param echoes
     worker = mp.Process(
         target=sim_worker,
-        args=(cmd_queue, shared, dbg_shared, _SCRIPT_DIR, DEFAULTS),
+        args=(cmd_queue, shared, dbg_shared, _SCRIPT_DIR, DEFAULTS, ui_queue),
     )
     worker.start()
 
     try:
-        run_ui(cmd_queue, shared, dbg_shared)
+        run_ui(cmd_queue, shared, dbg_shared, ui_queue)
     finally:
         cmd_queue.put(("stop",))
         worker.join(timeout=5.0)
